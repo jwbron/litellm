@@ -123,11 +123,11 @@ const TeamsTable = ({
                   <YourRoleCell team={team} userId={userId} />
                   <TableCell>
                     <Text>
-                      {perTeamInfo &&
+                      {(perTeamInfo &&
                         team.team_id &&
                         perTeamInfo[team.team_id] &&
-                        perTeamInfo[team.team_id].keys &&
-                        perTeamInfo[team.team_id].keys.length}{" "}
+                        perTeamInfo[team.team_id].keys_count) ??
+                        0}{" "}
                       Keys
                     </Text>
                     <Text>

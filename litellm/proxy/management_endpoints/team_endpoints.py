@@ -3937,11 +3937,13 @@ async def _batch_resolve_access_group_resources(
 def _convert_teams_to_response_models(
     teams: list,
     use_deleted_table: bool,
+    keys_count_by_team: Optional[Dict[str, int]] = None,
 ) -> List[Union[TeamListItem, LiteLLM_TeamTable, LiteLLM_DeletedTeamTable]]:
     """Convert raw Prisma team rows to response models."""
     team_list: List[
         Union[TeamListItem, LiteLLM_TeamTable, LiteLLM_DeletedTeamTable]
     ] = []
+    counts = keys_count_by_team or {}
     for team in teams:
         try:
             team_dict = team.model_dump()
@@ -3956,7 +3958,14 @@ def _convert_teams_to_response_models(
                 members_with_roles = []
                 team_dict["members_with_roles"] = members_with_roles
             members_count = len(members_with_roles)
-            team_list.append(TeamListItem(**team_dict, members_count=members_count))
+            keys_count = counts.get(team_dict.get("team_id") or "", 0)
+            team_list.append(
+                TeamListItem(
+                    **team_dict,
+                    members_count=members_count,
+                    keys_count=keys_count,
+                )
+            )
     return team_list
 
 
@@ -4187,8 +4196,35 @@ async def list_team_v2(
     # Calculate total pages
     total_pages = -(-total_count // page_size)  # Ceiling division
 
-    # Convert Prisma models to response models with members_count
-    team_list = _convert_teams_to_response_models(teams, use_deleted_table)
+    # Aggregate virtual-key counts per team for the current page in a single
+    # GROUP BY. The IN clause is bounded by page_size and uses the existing
+    # @@index([team_id]) on LiteLLM_VerificationToken.
+    keys_count_by_team: Dict[str, int] = {}
+    if not use_deleted_table:
+        page_team_ids = [
+            getattr(t, "team_id", None) for t in teams if getattr(t, "team_id", None)
+        ]
+        if page_team_ids:
+            grouped = await prisma_client.db.litellm_verificationtoken.group_by(
+                by=["team_id"],
+                where={"team_id": {"in": page_team_ids}},
+                count={"team_id": True},
+            )
+            for row in grouped:
+                tid = row.get("team_id") if isinstance(row, dict) else None
+                if not tid:
+                    continue
+                count_val = (
+                    row.get("_count", {}).get("team_id", 0)
+                    if isinstance(row, dict)
+                    else 0
+                )
+                keys_count_by_team[tid] = count_val
+
+    # Convert Prisma models to response models with members_count and keys_count
+    team_list = _convert_teams_to_response_models(
+        teams, use_deleted_table, keys_count_by_team=keys_count_by_team
+    )
 
     # Resolve resources inherited from access groups (single batch query)
     if not use_deleted_table:

@@ -44,6 +44,7 @@ interface TeamInfo {
 
 interface PerTeamInfo {
   keys: KeyResponse[];
+  keys_count: number;
   team_info: TeamInfo;
 }
 
@@ -93,6 +94,7 @@ const TeamsView: React.FC<TeamProps> = ({
         (acc, team) => {
           acc[team.team_id] = {
             keys: team.keys || [],
+            keys_count: team.keys_count ?? team.keys?.length ?? 0,
             team_info: {
               members_with_roles: team.members_with_roles || [],
             },
