@@ -25,6 +25,7 @@ interface TeamInfo {
 
 interface PerTeamInfo {
   keys: KeyResponse[];
+  keys_count: number;
   team_info: TeamInfo;
 }
 
