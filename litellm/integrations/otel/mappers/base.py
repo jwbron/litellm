@@ -30,14 +30,7 @@ SpanData = Union[LLMCallSpanData, GuardrailSpanData, ServiceSpanData]
 
 
 def drop_none(values: Mapping[str, Optional[AttrValue]]) -> AttributeMap:
-    """Return ``values`` with ``None``-valued entries removed.
-
-    Mappers declare ``{attribute_key: source_value}`` as a single dict literal and
-    pipe it through this helper to skip absent fields — instead of guarding every
-    assignment with ``if x is not None``. Uses strict ``is not None`` so legitimate
-    zero / empty-string / ``False`` values survive; callers convert empty
-    collections to ``None`` themselves when they want those skipped.
-    """
+    """Return ``values`` with ``None``-valued entries removed."""
     return {k: v for k, v in values.items() if v is not None}
 
 

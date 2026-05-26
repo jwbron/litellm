@@ -1,8 +1,6 @@
 """Provider/exporter factory and the Baggage span processor.
 
-OTLP exporter imports are performed lazily inside :func:`build_span_exporter` so
-that importing this module never pulls in ``grpc`` (a contract enforced by
-``tests/.../test_opentelemetry_dynamic_imports.py``).
+OTLP exporter imports are performed lazily inside :func:`build_span_exporter`
 """
 
 from typing import Dict, Iterable, Optional, Tuple
@@ -40,12 +38,7 @@ def to_otel_span_kind(kind: LiteLLMSpanKind) -> SpanKind:
 
 
 class LiteLLMBaggageSpanProcessor(SpanProcessor):
-    """Stamps an allowlisted set of Baggage entries onto every span at start.
-
-    Only exact keys in ``allowed_keys`` or keys matching ``allowed_prefixes`` are
-    promoted, so arbitrary upstream Baggage and the full ``metadata`` blob are
-    never copied onto spans.
-    """
+    """Stamps an allowlisted set of Baggage entries onto every span at start."""
 
     def __init__(
         self,
@@ -56,9 +49,7 @@ class LiteLLMBaggageSpanProcessor(SpanProcessor):
         self._allowed_prefixes = tuple(allowed_prefixes)
 
     def _is_allowed(self, key: str) -> bool:
-        return key in self._allowed_keys or any(
-            key.startswith(prefix) for prefix in self._allowed_prefixes
-        )
+        return key in self._allowed_keys or any(key.startswith(prefix) for prefix in self._allowed_prefixes)
 
     def on_start(self, span: Span, parent_context: Optional[Context] = None) -> None:
         for key, value in baggage.get_all(parent_context).items():
@@ -96,17 +87,13 @@ def build_span_exporter(config: OpenTelemetryV2Config) -> SpanExporter:
             OTLPSpanExporter as HTTPExporter,
         )
 
-        return HTTPExporter(
-            endpoint=config.endpoint, headers=parse_headers(config.headers)
-        )
+        return HTTPExporter(endpoint=config.endpoint, headers=parse_headers(config.headers))
     if exporter in ("otlp_grpc", "grpc"):
         from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
             OTLPSpanExporter as GRPCExporter,
         )
 
-        return GRPCExporter(
-            endpoint=config.endpoint, headers=parse_headers(config.headers)
-        )
+        return GRPCExporter(endpoint=config.endpoint, headers=parse_headers(config.headers))
     return ConsoleSpanExporter()
 
 
@@ -130,20 +117,14 @@ def build_tracer_provider(
     """
     provider = TracerProvider(resource=build_resource(config))
     if baggage_processor is None:
-        baggage_processor = LiteLLMBaggageSpanProcessor(
-            allowed_keys=config.baggage_promoted_keys
-        )
+        baggage_processor = LiteLLMBaggageSpanProcessor(allowed_keys=config.baggage_promoted_keys)
     provider.add_span_processor(baggage_processor)
 
     span_exporter = exporter if exporter is not None else build_span_exporter(config)
     if use_simple_processor is None:
-        use_simple_processor = isinstance(
-            span_exporter, (ConsoleSpanExporter, InMemorySpanExporter)
-        )
+        use_simple_processor = isinstance(span_exporter, (ConsoleSpanExporter, InMemorySpanExporter))
     export_processor: SpanProcessor = (
-        SimpleSpanProcessor(span_exporter)
-        if use_simple_processor
-        else BatchSpanProcessor(span_exporter)
+        SimpleSpanProcessor(span_exporter) if use_simple_processor else BatchSpanProcessor(span_exporter)
     )
     provider.add_span_processor(export_processor)
     return provider

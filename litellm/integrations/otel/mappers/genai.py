@@ -35,8 +35,6 @@ class GenAIMapper:
     @staticmethod
     def _llm_call(data: LLMCallSpanData) -> AttributeMap:
         rp, u, s, idn = data.request_params, data.usage, data.server, data.identity
-        # Empty collections are pre-converted to ``None`` so ``drop_none`` skips
-        # them — strict ``is not None`` keeps legitimate zero values intact.
         stop = list(rp.stop_sequences) if rp.stop_sequences else None
         finishes = list(data.finish_reasons) if data.finish_reasons else None
         return drop_none(

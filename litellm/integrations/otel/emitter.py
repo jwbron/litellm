@@ -1,10 +1,3 @@
-"""The span engine: turn typed span data + the registry into emitted spans.
-
-Driven entirely by ``spans.SPAN_REGISTRY`` (kind/hierarchy) and the mapper chain
-(attributes). One :meth:`SpanEmitter.emit` entry point handles every span kind —
-the engine never inlines attribute keys; that's the mapper's job.
-"""
-
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from opentelemetry.context import Context
@@ -34,9 +27,7 @@ def default_mappers(config: OpenTelemetryV2Config) -> List[AttributeMapper]:
     return mappers
 
 
-# Roles the engine knows how to emit, paired with the name builder for the
-# matching SpanData type. PROXY_REQUEST / MANAGEMENT are root spans owned by
-# callers (started via ``SpanEmitter._start``) and aren't in this table.
+# Roles emit() knows how to emit. PROXY_REQUEST / MANAGEMENT are caller-owned roots.
 _NAME_BUILDERS: Dict[SpanRole, Callable[..., str]] = {
     SpanRole.LLM_CALL: llm_call_span_name,
     SpanRole.GUARDRAIL: guardrail_span_name,
@@ -53,9 +44,7 @@ class SpanEmitter:
     ) -> None:
         self._tracer = tracer
         self._config = config
-        self._mappers: List[AttributeMapper] = (
-            list(mappers) if mappers is not None else default_mappers(config)
-        )
+        self._mappers: List[AttributeMapper] = list(mappers) if mappers is not None else default_mappers(config)
         self._emitted: Set[Tuple[str, SpanRole]] = set()
 
     # -- low-level helpers --------------------------------------------------- #
@@ -95,12 +84,7 @@ class SpanEmitter:
         start_time_ns: Optional[int] = None,
         end_time_ns: Optional[int] = None,
     ) -> Optional[Span]:
-        """Emit a span of ``role`` from ``data``.
-
-        Single lifecycle for every span kind: dedup → start → mapper chain →
-        status (from an optional ``error`` field) → end. Returns ``None`` only
-        when the span was suppressed by the idempotency guard.
-        """
+        """Dedup → start → mapper chain → status → end. ``None`` only when deduped."""
         identity = getattr(data, "identity", None)
         dedup_key = getattr(identity, "call_id", None) if identity is not None else None
         if self._seen(dedup_key, role):
@@ -117,12 +101,7 @@ class SpanEmitter:
         error = getattr(data, "error", None)
         if error and (error.error_type or error.message):
             span.set_attribute(Error.TYPE, error.error_type or "error")
-            span.set_status(
-                Status(
-                    StatusCode.ERROR,
-                    error.message or error.error_type or "error",
-                )
-            )
+            span.set_status(Status(StatusCode.ERROR, error.message or error.error_type or "error"))
         else:
             span.set_status(Status(StatusCode.OK))
         span.end(end_time=end_time_ns)

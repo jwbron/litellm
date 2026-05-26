@@ -1,10 +1,4 @@
-"""Trace-context + Baggage helpers.
-
-Loaded only when OpenTelemetry is in use, so it imports the SDK at module level.
-Baggage is the mechanism by which request-scoped identity (team, model, an
-allowlisted metadata subset) is propagated so a single span processor can stamp
-it onto every span — instead of per-call-site duplication.
-"""
+"""Trace-context + Baggage helpers."""
 
 from typing import Dict, Mapping, Optional
 
@@ -18,9 +12,7 @@ from opentelemetry.trace.propagation.tracecontext import (
 _PROPAGATOR = TraceContextTextMapPropagator()
 
 
-def set_request_baggage(
-    values: Mapping[str, str], context: Optional[Context] = None
-) -> Context:
+def set_request_baggage(values: Mapping[str, str], context: Optional[Context] = None) -> Context:
     """Return a context with ``values`` written into Baggage."""
     ctx = context
     for key, value in values.items():

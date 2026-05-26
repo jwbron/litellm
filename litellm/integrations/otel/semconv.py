@@ -1,9 +1,4 @@
-"""Source of truth #1 for the LiteLLM OpenTelemetry instrumentation: attribute keys.
-
-This module is intentionally free of any ``opentelemetry`` import so it can be
-imported in environments where the OTel SDK is not installed. It is the *only*
-place where a span-attribute key string or metric name is written.
-
+"""
 Keys follow the OpenTelemetry GenAI semantic conventions (experimental). Anything
 without a semconv equivalent lives under the ``litellm.*`` vendor namespace.
 """
@@ -125,7 +120,6 @@ class Metric:
 
 
 # Identity keys promoted onto every span via Baggage (bounded allowlist).
-# NOTE: http.* is deliberately excluded — it belongs on the SERVER span only.
 BAGGAGE_PROMOTED_KEYS: Final[Tuple[str, ...]] = (
     LiteLLM.TEAM_ID,
     LiteLLM.TEAM_ALIAS,

@@ -1,11 +1,4 @@
-"""Dual-emit mapper: deprecated attribute keys kept for backward compatibility.
-
-These keys are intentionally NOT in ``semconv.py`` — that module holds only the
-canonical keys. This is the single place legacy/deprecated strings live, so they
-can be deleted wholesale once the deprecation window closes. Only the LLM-call
-span has legacy keys; guardrail / service span vocabularies were never in the
-deprecated convention.
-"""
+"""Dual-emit mapper: deprecated attribute keys kept for backward compatibility."""
 
 from typing import Final, cast
 

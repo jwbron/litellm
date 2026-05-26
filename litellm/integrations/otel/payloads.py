@@ -1,12 +1,3 @@
-"""Source of truth #3 for the LiteLLM OpenTelemetry instrumentation: typed inputs.
-
-Every span is built from a frozen, typed model defined here. The ``from_*``
-classmethods are the single chokepoint where untyped litellm internals (the
-``StandardLoggingPayload`` / ``ServiceLoggerPayload`` dicts) are read and
-normalized; everything downstream of them is fully typed. This module imports no
-``opentelemetry`` symbols.
-"""
-
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -151,8 +142,6 @@ class ServerInfo:
 
 @dataclass(frozen=True)
 class RequestIdentity:
-    """Request-scoped identity. The promotable subset rides Baggage to all spans."""
-
     call_id: Optional[str] = None
     team_id: Optional[str] = None
     team_alias: Optional[str] = None
@@ -168,8 +157,7 @@ class RequestIdentity:
             if isinstance(value, (str, bool, int, float)):
                 metadata[key] = str(value)
         return cls(
-            call_id=_as_str(payload.get("litellm_call_id"))
-            or _as_str(payload.get("id")),
+            call_id=_as_str(payload.get("litellm_call_id")) or _as_str(payload.get("id")),
             team_id=_as_str(raw_meta.get("team_id")),
             team_alias=_as_str(raw_meta.get("team_alias")),
             key_hash=_as_str(raw_meta.get("user_api_key_hash")),
@@ -239,12 +227,8 @@ class LLMCallSpanData:
     is_streaming: Optional[bool] = None
 
     @classmethod
-    def from_standard_logging_payload(
-        cls, payload: "StandardLoggingPayload"
-    ) -> "LLMCallSpanData":
-        model_parameters = cast(
-            Mapping[str, object], payload.get("model_parameters") or {}
-        )
+    def from_standard_logging_payload(cls, payload: "StandardLoggingPayload") -> "LLMCallSpanData":
+        model_parameters = cast(Mapping[str, object], payload.get("model_parameters") or {})
         response = payload.get("response")
         response_id: Optional[str] = None
         response_model: Optional[str] = None
@@ -262,14 +246,10 @@ class LLMCallSpanData:
 
         error: Optional[SpanError] = None
         if payload.get("status") == "failure":
-            error_info = cast(
-                Mapping[str, object], payload.get("error_information") or {}
-            )
+            error_info = cast(Mapping[str, object], payload.get("error_information") or {})
             error = SpanError(
-                error_type=_as_str(error_info.get("error_class"))
-                or _as_str(error_info.get("error_code")),
-                message=_as_str(error_info.get("error_message"))
-                or _as_str(payload.get("error_str")),
+                error_type=_as_str(error_info.get("error_class")) or _as_str(error_info.get("error_code")),
+                message=_as_str(error_info.get("error_message")) or _as_str(payload.get("error_str")),
             )
 
         hidden_params = cast(Mapping[str, object], payload.get("hidden_params") or {})
@@ -288,10 +268,7 @@ class LLMCallSpanData:
             finish_reasons=tuple(finish_reasons),
             error=error,
             response_cost=_as_float(payload.get("response_cost")),
-            server=ServerInfo.from_api_base(
-                _as_str(payload.get("api_base"))
-                or _as_str(hidden_params.get("api_base"))
-            ),
+            server=ServerInfo.from_api_base(_as_str(payload.get("api_base")) or _as_str(hidden_params.get("api_base"))),
             identity=RequestIdentity.from_payload(payload),
             is_streaming=_as_bool(payload.get("stream")),
         )
@@ -303,11 +280,7 @@ def promoted_baggage(
     promoted_keys: Tuple[str, ...],
     metadata_keys: Tuple[str, ...] = DEFAULT_BAGGAGE_METADATA_KEYS,
 ) -> Dict[str, str]:
-    """Assemble the bounded set of values to write into Baggage for promotion.
-
-    Only keys in ``promoted_keys`` (and metadata sub-keys in ``metadata_keys``)
-    are included — never the full metadata blob, and never ``http.*``.
-    """
+    """Assemble the bounded set of values to write into Baggage for promotion."""
     candidate: Dict[str, Optional[str]] = {
         LiteLLM.TEAM_ID: identity.team_id,
         LiteLLM.TEAM_ALIAS: identity.team_alias,
@@ -315,9 +288,7 @@ def promoted_baggage(
         LiteLLM.END_USER: identity.end_user,
         GenAI.REQUEST_MODEL: request_model,
     }
-    out: Dict[str, str] = {
-        key: value for key, value in candidate.items() if key in promoted_keys and value
-    }
+    out: Dict[str, str] = {key: value for key, value in candidate.items() if key in promoted_keys and value}
     for meta_key in metadata_keys:
         value = identity.metadata.get(meta_key)
         if value:
