@@ -51,11 +51,21 @@ class SpanSpec:
 
 
 SPAN_REGISTRY: Dict[SpanRole, SpanSpec] = {
-    SpanRole.PROXY_REQUEST: SpanSpec(SpanRole.PROXY_REQUEST, LiteLLMSpanKind.SERVER, parent=None),
-    SpanRole.LLM_CALL: SpanSpec(SpanRole.LLM_CALL, LiteLLMSpanKind.CLIENT, parent=SpanRole.PROXY_REQUEST),
-    SpanRole.GUARDRAIL: SpanSpec(SpanRole.GUARDRAIL, LiteLLMSpanKind.INTERNAL, parent=SpanRole.LLM_CALL),
-    SpanRole.SERVICE: SpanSpec(SpanRole.SERVICE, LiteLLMSpanKind.INTERNAL, parent=SpanRole.PROXY_REQUEST),
-    SpanRole.MANAGEMENT: SpanSpec(SpanRole.MANAGEMENT, LiteLLMSpanKind.SERVER, parent=None),
+    SpanRole.PROXY_REQUEST: SpanSpec(
+        SpanRole.PROXY_REQUEST, LiteLLMSpanKind.SERVER, parent=None
+    ),
+    SpanRole.LLM_CALL: SpanSpec(
+        SpanRole.LLM_CALL, LiteLLMSpanKind.CLIENT, parent=SpanRole.PROXY_REQUEST
+    ),
+    SpanRole.GUARDRAIL: SpanSpec(
+        SpanRole.GUARDRAIL, LiteLLMSpanKind.INTERNAL, parent=SpanRole.LLM_CALL
+    ),
+    SpanRole.SERVICE: SpanSpec(
+        SpanRole.SERVICE, LiteLLMSpanKind.INTERNAL, parent=SpanRole.PROXY_REQUEST
+    ),
+    SpanRole.MANAGEMENT: SpanSpec(
+        SpanRole.MANAGEMENT, LiteLLMSpanKind.SERVER, parent=None
+    ),
 }
 
 

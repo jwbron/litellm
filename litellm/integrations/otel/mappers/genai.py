@@ -4,8 +4,6 @@ Owns the attribute schema for every span kind the engine emits — LLM call,
 guardrail, and service — so the engine itself never references attribute keys.
 """
 
-from typing import cast
-
 from litellm.integrations.otel.mappers.base import (
     AttributeMap,
     SpanData,
@@ -24,12 +22,14 @@ class GenAIMapper:
     """Emits ``gen_ai.*`` (and a few ``litellm.*`` vendor) attributes."""
 
     def map(self, role: SpanRole, data: SpanData) -> AttributeMap:
-        if role is SpanRole.LLM_CALL:
-            return self._llm_call(cast(LLMCallSpanData, data))
-        if role is SpanRole.GUARDRAIL:
-            return self._guardrail(cast(GuardrailSpanData, data))
-        if role is SpanRole.SERVICE:
-            return self._service(cast(ServiceSpanData, data))
+        # Dispatch on the concrete data type — ``isinstance`` narrows the union
+        # for mypy and avoids unchecked ``cast`` calls.
+        if isinstance(data, LLMCallSpanData):
+            return self._llm_call(data)
+        if isinstance(data, GuardrailSpanData):
+            return self._guardrail(data)
+        if isinstance(data, ServiceSpanData):
+            return self._service(data)
         return {}
 
     @staticmethod

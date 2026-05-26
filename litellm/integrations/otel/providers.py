@@ -49,7 +49,9 @@ class LiteLLMBaggageSpanProcessor(SpanProcessor):
         self._allowed_prefixes = tuple(allowed_prefixes)
 
     def _is_allowed(self, key: str) -> bool:
-        return key in self._allowed_keys or any(key.startswith(prefix) for prefix in self._allowed_prefixes)
+        return key in self._allowed_keys or any(
+            key.startswith(prefix) for prefix in self._allowed_prefixes
+        )
 
     def on_start(self, span: Span, parent_context: Optional[Context] = None) -> None:
         for key, value in baggage.get_all(parent_context).items():
@@ -87,13 +89,17 @@ def build_span_exporter(config: OpenTelemetryV2Config) -> SpanExporter:
             OTLPSpanExporter as HTTPExporter,
         )
 
-        return HTTPExporter(endpoint=config.endpoint, headers=parse_headers(config.headers))
+        return HTTPExporter(
+            endpoint=config.endpoint, headers=parse_headers(config.headers)
+        )
     if exporter in ("otlp_grpc", "grpc"):
         from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
             OTLPSpanExporter as GRPCExporter,
         )
 
-        return GRPCExporter(endpoint=config.endpoint, headers=parse_headers(config.headers))
+        return GRPCExporter(
+            endpoint=config.endpoint, headers=parse_headers(config.headers)
+        )
     return ConsoleSpanExporter()
 
 
@@ -117,14 +123,20 @@ def build_tracer_provider(
     """
     provider = TracerProvider(resource=build_resource(config))
     if baggage_processor is None:
-        baggage_processor = LiteLLMBaggageSpanProcessor(allowed_keys=config.baggage_promoted_keys)
+        baggage_processor = LiteLLMBaggageSpanProcessor(
+            allowed_keys=config.baggage_promoted_keys
+        )
     provider.add_span_processor(baggage_processor)
 
     span_exporter = exporter if exporter is not None else build_span_exporter(config)
     if use_simple_processor is None:
-        use_simple_processor = isinstance(span_exporter, (ConsoleSpanExporter, InMemorySpanExporter))
+        use_simple_processor = isinstance(
+            span_exporter, (ConsoleSpanExporter, InMemorySpanExporter)
+        )
     export_processor: SpanProcessor = (
-        SimpleSpanProcessor(span_exporter) if use_simple_processor else BatchSpanProcessor(span_exporter)
+        SimpleSpanProcessor(span_exporter)
+        if use_simple_processor
+        else BatchSpanProcessor(span_exporter)
     )
     provider.add_span_processor(export_processor)
     return provider

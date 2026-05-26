@@ -12,7 +12,9 @@ from opentelemetry.trace.propagation.tracecontext import (
 _PROPAGATOR = TraceContextTextMapPropagator()
 
 
-def set_request_baggage(values: Mapping[str, str], context: Optional[Context] = None) -> Context:
+def set_request_baggage(
+    values: Mapping[str, str], context: Optional[Context] = None
+) -> Context:
     """Return a context with ``values`` written into Baggage."""
     ctx = context
     for key, value in values.items():

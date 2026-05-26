@@ -157,7 +157,8 @@ class RequestIdentity:
             if isinstance(value, (str, bool, int, float)):
                 metadata[key] = str(value)
         return cls(
-            call_id=_as_str(payload.get("litellm_call_id")) or _as_str(payload.get("id")),
+            call_id=_as_str(payload.get("litellm_call_id"))
+            or _as_str(payload.get("id")),
             team_id=_as_str(raw_meta.get("team_id")),
             team_alias=_as_str(raw_meta.get("team_alias")),
             key_hash=_as_str(raw_meta.get("user_api_key_hash")),
@@ -182,13 +183,12 @@ class ServiceSpanData:
 
     @classmethod
     def from_payload(cls, payload: "ServiceLoggerPayload") -> "ServiceSpanData":
-        service = getattr(payload, "service", None)
-        service_name = getattr(service, "value", None) or str(service or "service")
-        error_text = getattr(payload, "error", None)
+        # ``payload.service`` is a ``ServiceTypes(str, Enum)`` and ``error`` is
+        # ``Optional[str]`` on the Pydantic model — no defensive reads needed.
         return cls(
-            service_name=service_name,
-            call_type=getattr(payload, "call_type", None),
-            error=SpanError(message=_as_str(error_text)) if error_text else None,
+            service_name=payload.service.value,
+            call_type=payload.call_type,
+            error=SpanError(message=payload.error) if payload.error else None,
         )
 
 
@@ -227,8 +227,12 @@ class LLMCallSpanData:
     is_streaming: Optional[bool] = None
 
     @classmethod
-    def from_standard_logging_payload(cls, payload: "StandardLoggingPayload") -> "LLMCallSpanData":
-        model_parameters = cast(Mapping[str, object], payload.get("model_parameters") or {})
+    def from_standard_logging_payload(
+        cls, payload: "StandardLoggingPayload"
+    ) -> "LLMCallSpanData":
+        model_parameters = cast(
+            Mapping[str, object], payload.get("model_parameters") or {}
+        )
         response = payload.get("response")
         response_id: Optional[str] = None
         response_model: Optional[str] = None
@@ -246,10 +250,14 @@ class LLMCallSpanData:
 
         error: Optional[SpanError] = None
         if payload.get("status") == "failure":
-            error_info = cast(Mapping[str, object], payload.get("error_information") or {})
+            error_info = cast(
+                Mapping[str, object], payload.get("error_information") or {}
+            )
             error = SpanError(
-                error_type=_as_str(error_info.get("error_class")) or _as_str(error_info.get("error_code")),
-                message=_as_str(error_info.get("error_message")) or _as_str(payload.get("error_str")),
+                error_type=_as_str(error_info.get("error_class"))
+                or _as_str(error_info.get("error_code")),
+                message=_as_str(error_info.get("error_message"))
+                or _as_str(payload.get("error_str")),
             )
 
         hidden_params = cast(Mapping[str, object], payload.get("hidden_params") or {})
@@ -268,7 +276,10 @@ class LLMCallSpanData:
             finish_reasons=tuple(finish_reasons),
             error=error,
             response_cost=_as_float(payload.get("response_cost")),
-            server=ServerInfo.from_api_base(_as_str(payload.get("api_base")) or _as_str(hidden_params.get("api_base"))),
+            server=ServerInfo.from_api_base(
+                _as_str(payload.get("api_base"))
+                or _as_str(hidden_params.get("api_base"))
+            ),
             identity=RequestIdentity.from_payload(payload),
             is_streaming=_as_bool(payload.get("stream")),
         )
@@ -288,7 +299,9 @@ def promoted_baggage(
         LiteLLM.END_USER: identity.end_user,
         GenAI.REQUEST_MODEL: request_model,
     }
-    out: Dict[str, str] = {key: value for key, value in candidate.items() if key in promoted_keys and value}
+    out: Dict[str, str] = {
+        key: value for key, value in candidate.items() if key in promoted_keys and value
+    }
     for meta_key in metadata_keys:
         value = identity.metadata.get(meta_key)
         if value:

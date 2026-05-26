@@ -1,6 +1,6 @@
 """Dual-emit mapper: deprecated attribute keys kept for backward compatibility."""
 
-from typing import Final, cast
+from typing import Final
 
 from litellm.integrations.otel.mappers.base import (
     AttributeMap,
@@ -26,9 +26,11 @@ class LegacyMapper:
     """Re-emits LLM-call values under their deprecated key names."""
 
     def map(self, role: SpanRole, data: SpanData) -> AttributeMap:
-        if role is not SpanRole.LLM_CALL:
+        # Legacy vocabulary only ever covered LLM calls; isinstance narrows
+        # without needing ``cast``.
+        if not isinstance(data, LLMCallSpanData):
             return {}
-        return self._llm_call(cast(LLMCallSpanData, data))
+        return self._llm_call(data)
 
     @staticmethod
     def _llm_call(data: LLMCallSpanData) -> AttributeMap:

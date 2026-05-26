@@ -8,6 +8,7 @@ from litellm.integrations.otel.config import OpenTelemetryV2Config
 from litellm.integrations.otel.mappers.base import AttributeMapper, SpanData
 from litellm.integrations.otel.mappers.genai import GenAIMapper
 from litellm.integrations.otel.mappers.legacy import LegacyMapper
+from litellm.integrations.otel.payloads import LLMCallSpanData, ServiceSpanData
 from litellm.integrations.otel.providers import to_otel_span_kind
 from litellm.integrations.otel.semconv import Error
 from litellm.integrations.otel.spans import (
@@ -44,7 +45,9 @@ class SpanEmitter:
     ) -> None:
         self._tracer = tracer
         self._config = config
-        self._mappers: List[AttributeMapper] = list(mappers) if mappers is not None else default_mappers(config)
+        self._mappers: List[AttributeMapper] = (
+            list(mappers) if mappers is not None else default_mappers(config)
+        )
         self._emitted: Set[Tuple[str, SpanRole]] = set()
 
     # -- low-level helpers --------------------------------------------------- #
@@ -85,8 +88,10 @@ class SpanEmitter:
         end_time_ns: Optional[int] = None,
     ) -> Optional[Span]:
         """Dedup → start → mapper chain → status → end. ``None`` only when deduped."""
-        identity = getattr(data, "identity", None)
-        dedup_key = getattr(identity, "call_id", None) if identity is not None else None
+        # Only LLM-call spans carry a dedup key; only LLM-call and service spans
+        # carry an ``error`` field. ``isinstance`` gives mypy real narrowing and
+        # keeps the engine free of duck-typed attribute reads.
+        dedup_key = data.identity.call_id if isinstance(data, LLMCallSpanData) else None
         if self._seen(dedup_key, role):
             return None
         span = self._start(
@@ -98,10 +103,14 @@ class SpanEmitter:
         for mapper in self._mappers:
             for key, value in mapper.map(role, data).items():
                 span.set_attribute(key, value)
-        error = getattr(data, "error", None)
+        error = (
+            data.error if isinstance(data, (LLMCallSpanData, ServiceSpanData)) else None
+        )
         if error and (error.error_type or error.message):
             span.set_attribute(Error.TYPE, error.error_type or "error")
-            span.set_status(Status(StatusCode.ERROR, error.message or error.error_type or "error"))
+            span.set_status(
+                Status(StatusCode.ERROR, error.message or error.error_type or "error")
+            )
         else:
             span.set_status(Status(StatusCode.OK))
         span.end(end_time=end_time_ns)

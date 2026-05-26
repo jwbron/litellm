@@ -50,8 +50,12 @@ class OpenTelemetryV2Config(BaseSettings):
         default=None,
         validation_alias=AliasChoices("OTEL_HEADERS", "OTEL_EXPORTER_OTLP_HEADERS"),
     )
-    service_name: str = Field(default="litellm", validation_alias=AliasChoices("OTEL_SERVICE_NAME"))
-    deployment_environment: Optional[str] = Field(default=None, validation_alias=AliasChoices("OTEL_ENVIRONMENT_NAME"))
+    service_name: str = Field(
+        default="litellm", validation_alias=AliasChoices("OTEL_SERVICE_NAME")
+    )
+    deployment_environment: Optional[str] = Field(
+        default=None, validation_alias=AliasChoices("OTEL_ENVIRONMENT_NAME")
+    )
 
     enable_metrics: bool = Field(
         default=False,
@@ -59,7 +63,9 @@ class OpenTelemetryV2Config(BaseSettings):
     )
     capture_message_content: str = Field(
         default=CaptureMessageContent.NO_CONTENT,
-        validation_alias=AliasChoices("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"),
+        validation_alias=AliasChoices(
+            "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
+        ),
     )
     ignore_context_propagation: bool = Field(
         default=False,
@@ -68,12 +74,18 @@ class OpenTelemetryV2Config(BaseSettings):
 
     #: Emit legacy attribute keys / span names alongside canonical ones during the
     #: deprecation window. Defaults on so existing dashboards keep working.
-    legacy_compat: bool = Field(default=True, validation_alias=AliasChoices("LITELLM_OTEL_LEGACY_COMPAT"))
+    legacy_compat: bool = Field(
+        default=True, validation_alias=AliasChoices("LITELLM_OTEL_LEGACY_COMPAT")
+    )
 
     #: Bounded allowlists for Baggage-based promotion of request-scoped identity
     #: onto every span (see ``providers.LiteLLMBaggageSpanProcessor``).
-    baggage_promoted_keys: List[str] = Field(default_factory=lambda: list(BAGGAGE_PROMOTED_KEYS))
-    baggage_metadata_keys: List[str] = Field(default_factory=lambda: list(DEFAULT_BAGGAGE_METADATA_KEYS))
+    baggage_promoted_keys: List[str] = Field(
+        default_factory=lambda: list(BAGGAGE_PROMOTED_KEYS)
+    )
+    baggage_metadata_keys: List[str] = Field(
+        default_factory=lambda: list(DEFAULT_BAGGAGE_METADATA_KEYS)
+    )
 
     @model_validator(mode="after")
     def _endpoint_implies_otlp_http(self) -> "OpenTelemetryV2Config":
