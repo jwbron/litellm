@@ -1,14 +1,39 @@
-"""Canonical OpenTelemetry GenAI semantic-convention mapper (always active)."""
+"""Canonical OpenTelemetry GenAI semantic-convention mapper (always active).
 
-from litellm.integrations.otel.mappers.base import AttributeMap, drop_none
-from litellm.integrations.otel.payloads import LLMCallSpanData
+Owns the attribute schema for every span kind the engine emits — LLM call,
+guardrail, and service — so the engine itself never references attribute keys.
+"""
+
+from typing import cast
+
+from litellm.integrations.otel.mappers.base import (
+    AttributeMap,
+    SpanData,
+    drop_none,
+)
+from litellm.integrations.otel.payloads import (
+    GuardrailSpanData,
+    LLMCallSpanData,
+    ServiceSpanData,
+)
 from litellm.integrations.otel.semconv import Error, GenAI, LiteLLM, Server
+from litellm.integrations.otel.spans import SpanRole
 
 
 class GenAIMapper:
     """Emits ``gen_ai.*`` (and a few ``litellm.*`` vendor) attributes."""
 
-    def map_llm_call(self, data: LLMCallSpanData) -> AttributeMap:
+    def map(self, role: SpanRole, data: SpanData) -> AttributeMap:
+        if role is SpanRole.LLM_CALL:
+            return self._llm_call(cast(LLMCallSpanData, data))
+        if role is SpanRole.GUARDRAIL:
+            return self._guardrail(cast(GuardrailSpanData, data))
+        if role is SpanRole.SERVICE:
+            return self._service(cast(ServiceSpanData, data))
+        return {}
+
+    @staticmethod
+    def _llm_call(data: LLMCallSpanData) -> AttributeMap:
         rp, u, s, idn = data.request_params, data.usage, data.server, data.identity
         # Empty collections are pre-converted to ``None`` so ``drop_none`` skips
         # them — strict ``is not None`` keeps legitimate zero values intact.
@@ -38,5 +63,24 @@ class GenAIMapper:
                 LiteLLM.CALL_ID: idn.call_id or None,
                 f"{LiteLLM.COST_PREFIX}total": data.response_cost,
                 LiteLLM.REQUEST_STREAMING: data.is_streaming,
+            }
+        )
+
+    @staticmethod
+    def _guardrail(data: GuardrailSpanData) -> AttributeMap:
+        return drop_none(
+            {
+                LiteLLM.GUARDRAIL_NAME: data.guardrail_name,
+                LiteLLM.GUARDRAIL_MODE: data.mode,
+                LiteLLM.GUARDRAIL_STATUS: data.status,
+            }
+        )
+
+    @staticmethod
+    def _service(data: ServiceSpanData) -> AttributeMap:
+        return drop_none(
+            {
+                LiteLLM.SERVICE_NAME: data.service_name,
+                LiteLLM.SERVICE_CALL_TYPE: data.call_type,
             }
         )

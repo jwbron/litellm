@@ -60,7 +60,7 @@ def _engine(legacy_compat=True):
 def test_llm_call_span_golden():
     engine, exporter = _engine()
     data = LLMCallSpanData.from_standard_logging_payload(_payload())
-    engine.emit_llm_call(data)
+    engine.emit(SpanRole.LLM_CALL, data)
     (span,) = exporter.get_finished_spans()
     assert span.name == "chat gpt-4o"
     assert span.kind is SpanKind.CLIENT
@@ -82,7 +82,9 @@ def test_llm_call_span_golden():
 
 def test_legacy_dual_emit_on():
     engine, exporter = _engine(legacy_compat=True)
-    engine.emit_llm_call(LLMCallSpanData.from_standard_logging_payload(_payload()))
+    engine.emit(
+        SpanRole.LLM_CALL, LLMCallSpanData.from_standard_logging_payload(_payload())
+    )
     (span,) = exporter.get_finished_spans()
     # canonical AND legacy keys are both present
     assert span.attributes[GenAI.USAGE_OUTPUT_TOKENS] == 5
@@ -92,7 +94,9 @@ def test_legacy_dual_emit_on():
 
 def test_legacy_dual_emit_off():
     engine, exporter = _engine(legacy_compat=False)
-    engine.emit_llm_call(LLMCallSpanData.from_standard_logging_payload(_payload()))
+    engine.emit(
+        SpanRole.LLM_CALL, LLMCallSpanData.from_standard_logging_payload(_payload())
+    )
     (span,) = exporter.get_finished_spans()
     # canonical present, legacy absent
     assert span.attributes[GenAI.USAGE_OUTPUT_TOKENS] == 5
@@ -106,7 +110,9 @@ def test_error_span_sets_status_and_error_type():
         status="failure",
         error_information={"error_class": "RateLimitError", "error_message": "429"},
     )
-    engine.emit_llm_call(LLMCallSpanData.from_standard_logging_payload(payload))
+    engine.emit(
+        SpanRole.LLM_CALL, LLMCallSpanData.from_standard_logging_payload(payload)
+    )
     (span,) = exporter.get_finished_spans()
     assert span.status.status_code is StatusCode.ERROR
     assert span.attributes["error.type"] == "RateLimitError"
@@ -117,9 +123,11 @@ def test_hierarchy_and_kinds_match_registry():
     data = LLMCallSpanData.from_standard_logging_payload(_payload())
     root = engine._start(SpanRole.PROXY_REQUEST, "POST /chat/completions")
     root_ctx = ctx_mod.context_from_span(root)
-    engine.emit_llm_call(data, parent_context=root_ctx)
-    engine.emit_guardrail(GuardrailSpanData("presidio", status="success"), root_ctx)
-    engine.emit_service(ServiceSpanData("redis", call_type="set"), root_ctx)
+    engine.emit(SpanRole.LLM_CALL, data, parent_context=root_ctx)
+    engine.emit(
+        SpanRole.GUARDRAIL, GuardrailSpanData("presidio", status="success"), root_ctx
+    )
+    engine.emit(SpanRole.SERVICE, ServiceSpanData("redis", call_type="set"), root_ctx)
     root.end()
 
     by_name = {s.name: s for s in exporter.get_finished_spans()}
@@ -137,8 +145,8 @@ def test_hierarchy_and_kinds_match_registry():
 def test_idempotent_dual_fire():
     engine, exporter = _engine()
     data = LLMCallSpanData.from_standard_logging_payload(_payload())
-    first = engine.emit_llm_call(data)
-    second = engine.emit_llm_call(data)  # same call_id -> deduped
+    first = engine.emit(SpanRole.LLM_CALL, data)
+    second = engine.emit(SpanRole.LLM_CALL, data)  # same call_id -> deduped
     assert first is not None
     assert second is None
     assert len(exporter.get_finished_spans()) == 1
@@ -148,10 +156,11 @@ def test_service_error_span():
     from litellm.integrations.otel.payloads import SpanError
 
     engine, exporter = _engine()
-    engine.emit_service(
+    engine.emit(
+        SpanRole.SERVICE,
         ServiceSpanData(
             "postgres", call_type="query", error=SpanError("DBError", "boom")
-        )
+        ),
     )
     (span,) = exporter.get_finished_spans()
     assert span.status.status_code is StatusCode.ERROR

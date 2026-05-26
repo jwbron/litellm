@@ -61,9 +61,11 @@ def test_identity_promoted_onto_every_span():
 
     root = engine._start(SpanRole.PROXY_REQUEST, "POST /chat/completions", ctx)
     root_ctx = ctx_mod.context_from_span(root, ctx)
-    engine.emit_llm_call(data, parent_context=root_ctx)
-    engine.emit_guardrail(GuardrailSpanData("presidio", status="success"), root_ctx)
-    engine.emit_service(ServiceSpanData("redis", call_type="set"), root_ctx)
+    engine.emit(SpanRole.LLM_CALL, data, parent_context=root_ctx)
+    engine.emit(
+        SpanRole.GUARDRAIL, GuardrailSpanData("presidio", status="success"), root_ctx
+    )
+    engine.emit(SpanRole.SERVICE, ServiceSpanData("redis", call_type="set"), root_ctx)
     root.end()
 
     spans = exporter.get_finished_spans()
@@ -79,7 +81,7 @@ def test_allowlisted_metadata_subkey_promoted_blob_excluded():
     data = LLMCallSpanData.from_standard_logging_payload(_payload())
     bag = promoted_baggage(data.identity, data.request_model, BAGGAGE_PROMOTED_KEYS)
     ctx = ctx_mod.set_request_baggage(bag)
-    engine.emit_service(ServiceSpanData("redis", call_type="set"), ctx)
+    engine.emit(SpanRole.SERVICE, ServiceSpanData("redis", call_type="set"), ctx)
     (span,) = exporter.get_finished_spans()
     # allowlisted metadata sub-key is promoted
     assert (
@@ -100,7 +102,7 @@ def test_http_attributes_never_promoted():
             HTTP.REQUEST_METHOD: "POST",
         }
     )
-    engine.emit_service(ServiceSpanData("redis", call_type="set"), ctx)
+    engine.emit(SpanRole.SERVICE, ServiceSpanData("redis", call_type="set"), ctx)
     (span,) = exporter.get_finished_spans()
     assert span.attributes.get(LiteLLM.TEAM_ID) == "t1"
     assert HTTP.ROUTE not in span.attributes
@@ -112,7 +114,7 @@ def test_arbitrary_upstream_baggage_not_promoted():
     ctx = ctx_mod.set_request_baggage(
         {LiteLLM.TEAM_ID: "t1", "some.upstream.key": "leak"}
     )
-    engine.emit_service(ServiceSpanData("redis", call_type="set"), ctx)
+    engine.emit(SpanRole.SERVICE, ServiceSpanData("redis", call_type="set"), ctx)
     (span,) = exporter.get_finished_spans()
     assert span.attributes.get(LiteLLM.TEAM_ID) == "t1"
     assert "some.upstream.key" not in span.attributes
@@ -125,7 +127,7 @@ def test_baggage_processor_allowlist_can_be_widened():
     )
     engine, exporter = _engine_and_exporter(cfg)
     ctx = ctx_mod.set_request_baggage({"custom.key": "v", LiteLLM.TEAM_ALIAS: "ta"})
-    engine.emit_service(ServiceSpanData("redis"), ctx)
+    engine.emit(SpanRole.SERVICE, ServiceSpanData("redis"), ctx)
     (span,) = exporter.get_finished_spans()
     assert span.attributes.get("custom.key") == "v"
     # team_alias not in this config's allowlist -> not promoted

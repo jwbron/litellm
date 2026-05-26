@@ -1,26 +1,22 @@
 """The span engine: turn typed span data + the registry into emitted spans.
 
 Driven entirely by ``spans.SPAN_REGISTRY`` (kind/hierarchy) and the mapper chain
-(attributes). No untyped ``kwargs`` or god-objects cross its boundary.
+(attributes). One :meth:`SpanEmitter.emit` entry point handles every span kind —
+the engine never inlines attribute keys; that's the mapper's job.
 """
 
-from typing import List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from opentelemetry.context import Context
 from opentelemetry.trace import Span, Tracer
 from opentelemetry.trace.status import Status, StatusCode
 
 from litellm.integrations.otel.config import OpenTelemetryV2Config
-from litellm.integrations.otel.mappers.base import AttributeMapper, AttrValue
+from litellm.integrations.otel.mappers.base import AttributeMapper, SpanData
 from litellm.integrations.otel.mappers.genai import GenAIMapper
 from litellm.integrations.otel.mappers.legacy import LegacyMapper
-from litellm.integrations.otel.payloads import (
-    GuardrailSpanData,
-    LLMCallSpanData,
-    ServiceSpanData,
-)
 from litellm.integrations.otel.providers import to_otel_span_kind
-from litellm.integrations.otel.semconv import Error, LiteLLM
+from litellm.integrations.otel.semconv import Error
 from litellm.integrations.otel.spans import (
     SPAN_REGISTRY,
     SpanRole,
@@ -36,6 +32,16 @@ def default_mappers(config: OpenTelemetryV2Config) -> List[AttributeMapper]:
     if config.legacy_compat:
         mappers.append(LegacyMapper())
     return mappers
+
+
+# Roles the engine knows how to emit, paired with the name builder for the
+# matching SpanData type. PROXY_REQUEST / MANAGEMENT are root spans owned by
+# callers (started via ``SpanEmitter._start``) and aren't in this table.
+_NAME_BUILDERS: Dict[SpanRole, Callable[..., str]] = {
+    SpanRole.LLM_CALL: llm_call_span_name,
+    SpanRole.GUARDRAIL: guardrail_span_name,
+    SpanRole.SERVICE: service_span_name,
+}
 
 
 class SpanEmitter:
@@ -68,12 +74,6 @@ class SpanEmitter:
             start_time=start_time_ns,
         )
 
-    @staticmethod
-    def _set(span: Span, key: str, value: Optional[AttrValue]) -> None:
-        if value is None:
-            return
-        span.set_attribute(key, value)
-
     def _seen(self, dedup_key: Optional[str], role: SpanRole) -> bool:
         """Idempotency guard for the streaming sync+async dual-fire."""
         if not dedup_key:
@@ -84,69 +84,46 @@ class SpanEmitter:
         self._emitted.add(marker)
         return False
 
-    # -- span emitters ------------------------------------------------------- #
+    # -- the engine ---------------------------------------------------------- #
 
-    def emit_llm_call(
+    def emit(
         self,
-        data: LLMCallSpanData,
+        role: SpanRole,
+        data: SpanData,
         parent_context: Optional[Context] = None,
+        *,
         start_time_ns: Optional[int] = None,
         end_time_ns: Optional[int] = None,
     ) -> Optional[Span]:
-        if self._seen(data.identity.call_id, SpanRole.LLM_CALL):
+        """Emit a span of ``role`` from ``data``.
+
+        Single lifecycle for every span kind: dedup → start → mapper chain →
+        status (from an optional ``error`` field) → end. Returns ``None`` only
+        when the span was suppressed by the idempotency guard.
+        """
+        identity = getattr(data, "identity", None)
+        dedup_key = getattr(identity, "call_id", None) if identity is not None else None
+        if self._seen(dedup_key, role):
             return None
         span = self._start(
-            SpanRole.LLM_CALL,
-            llm_call_span_name(data),
+            role,
+            _NAME_BUILDERS[role](data),
             parent_context=parent_context,
             start_time_ns=start_time_ns,
         )
         for mapper in self._mappers:
-            for key, value in mapper.map_llm_call(data).items():
+            for key, value in mapper.map(role, data).items():
                 span.set_attribute(key, value)
-        if data.error and data.error.error_type:
-            self._set(span, Error.TYPE, data.error.error_type)
+        error = getattr(data, "error", None)
+        if error and (error.error_type or error.message):
+            span.set_attribute(Error.TYPE, error.error_type or "error")
             span.set_status(
-                Status(StatusCode.ERROR, data.error.message or data.error.error_type)
+                Status(
+                    StatusCode.ERROR,
+                    error.message or error.error_type or "error",
+                )
             )
         else:
             span.set_status(Status(StatusCode.OK))
         span.end(end_time=end_time_ns)
-        return span
-
-    def emit_guardrail(
-        self,
-        data: GuardrailSpanData,
-        parent_context: Optional[Context] = None,
-    ) -> Span:
-        span = self._start(
-            SpanRole.GUARDRAIL,
-            guardrail_span_name(data),
-            parent_context=parent_context,
-        )
-        self._set(span, LiteLLM.GUARDRAIL_NAME, data.guardrail_name)
-        self._set(span, LiteLLM.GUARDRAIL_MODE, data.mode)
-        self._set(span, LiteLLM.GUARDRAIL_STATUS, data.status)
-        span.set_status(Status(StatusCode.OK))
-        span.end()
-        return span
-
-    def emit_service(
-        self,
-        data: ServiceSpanData,
-        parent_context: Optional[Context] = None,
-    ) -> Span:
-        span = self._start(
-            SpanRole.SERVICE,
-            service_span_name(data),
-            parent_context=parent_context,
-        )
-        self._set(span, LiteLLM.SERVICE_NAME, data.service_name)
-        self._set(span, LiteLLM.SERVICE_CALL_TYPE, data.call_type)
-        if data.error is not None:
-            self._set(span, Error.TYPE, data.error.error_type or "error")
-            span.set_status(Status(StatusCode.ERROR, data.error.message or "error"))
-        else:
-            span.set_status(Status(StatusCode.OK))
-        span.end()
         return span

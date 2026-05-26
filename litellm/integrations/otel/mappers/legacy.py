@@ -2,13 +2,20 @@
 
 These keys are intentionally NOT in ``semconv.py`` — that module holds only the
 canonical keys. This is the single place legacy/deprecated strings live, so they
-can be deleted wholesale once the deprecation window closes.
+can be deleted wholesale once the deprecation window closes. Only the LLM-call
+span has legacy keys; guardrail / service span vocabularies were never in the
+deprecated convention.
 """
 
-from typing import Final
+from typing import Final, cast
 
-from litellm.integrations.otel.mappers.base import AttributeMap, drop_none
+from litellm.integrations.otel.mappers.base import (
+    AttributeMap,
+    SpanData,
+    drop_none,
+)
 from litellm.integrations.otel.payloads import LLMCallSpanData
+from litellm.integrations.otel.spans import SpanRole
 
 # Deprecated keys (semconv-ai / Traceloop era).
 _LEGACY_SYSTEM: Final = "gen_ai.system"
@@ -23,9 +30,15 @@ _LEGACY_STOP_SEQUENCES: Final = "llm.chat.stop_sequences"
 
 
 class LegacyMapper:
-    """Re-emits canonical values under their deprecated key names."""
+    """Re-emits LLM-call values under their deprecated key names."""
 
-    def map_llm_call(self, data: LLMCallSpanData) -> AttributeMap:
+    def map(self, role: SpanRole, data: SpanData) -> AttributeMap:
+        if role is not SpanRole.LLM_CALL:
+            return {}
+        return self._llm_call(cast(LLMCallSpanData, data))
+
+    @staticmethod
+    def _llm_call(data: LLMCallSpanData) -> AttributeMap:
         rp, u = data.request_params, data.usage
         stop = list(rp.stop_sequences) if rp.stop_sequences else None
         return drop_none(
