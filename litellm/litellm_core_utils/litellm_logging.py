@@ -3979,6 +3979,28 @@ def _init_custom_logger_compatible_class(  # noqa: PLR0915
             _in_memory_loggers.append(_levo_otel_logger)
             return _levo_otel_logger  # type: ignore
         elif logging_integration == "otel":
+            # Gate the new typed V2 adapter behind LITELLM_OTEL_V2. When off,
+            # the legacy 3,227-line god-class is used unchanged. The two are
+            # never registered simultaneously — the dedup loop below treats
+            # any module under ``litellm.integrations.otel`` or
+            # ``litellm.integrations.opentelemetry`` as "the OTel callback".
+            from litellm.integrations.otel.config import is_otel_v2_enabled
+
+            if is_otel_v2_enabled():
+                from litellm.integrations.otel.logger import OpenTelemetryV2
+
+                for callback in _in_memory_loggers:
+                    if type(callback) is OpenTelemetryV2:
+                        return callback  # type: ignore
+                otel_logger_v2 = OpenTelemetryV2(
+                    **_get_custom_logger_settings_from_proxy_server(
+                        callback_name=logging_integration
+                    )
+                )
+                _in_memory_loggers.append(otel_logger_v2)
+                _maybe_auto_initialize_arize_phoenix(_in_memory_loggers)
+                return otel_logger_v2  # type: ignore
+
             from litellm.integrations.opentelemetry import OpenTelemetry
 
             for callback in _in_memory_loggers:

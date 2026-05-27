@@ -76,9 +76,11 @@ class GenAIMapper:
 
     @staticmethod
     def _service(data: ServiceSpanData) -> AttributeMap:
-        return drop_none(
-            {
-                LiteLLM.SERVICE_NAME: data.service_name,
-                LiteLLM.SERVICE_CALL_TYPE: data.call_type,
-            }
-        )
+        attrs: AttributeMap = {LiteLLM.SERVICE_NAME: data.service_name}
+        if data.call_type is not None:
+            attrs[LiteLLM.SERVICE_CALL_TYPE] = data.call_type
+        # Caller-supplied event_metadata goes under the canonical metadata
+        # namespace (the legacy mapper duplicates them bare for V1 dashboards).
+        for key, value in data.event_metadata.items():
+            attrs[f"{LiteLLM.METADATA_PREFIX}{key}"] = value
+        return attrs

@@ -239,10 +239,20 @@ def test_legacy_mapper_all_request_params():
     assert attrs["gen_ai.usage.total_tokens"] == 15
 
 
-def test_legacy_mapper_skips_non_llm_roles():
-    """Legacy keys exist only for LLM-call spans; other roles produce ``{}``."""
+def test_legacy_mapper_covers_service_with_v1_bare_keys():
+    """Service spans dual-emit V1's bare ``service``/``call_type``/``error`` keys."""
+    attrs = LegacyMapper().map(
+        SpanRole.SERVICE,
+        ServiceSpanData("redis", call_type="set", event_metadata={"k": "v"}),
+    )
+    assert attrs["service"] == "redis"
+    assert attrs["call_type"] == "set"
+    assert attrs["k"] == "v"  # event_metadata is stamped bare (V1 behavior)
+
+
+def test_legacy_mapper_skips_guardrail_role():
+    """Guardrail spans never had a V1 vocabulary; legacy mapper returns ``{}``."""
     assert LegacyMapper().map(SpanRole.GUARDRAIL, GuardrailSpanData("presidio")) == {}
-    assert LegacyMapper().map(SpanRole.SERVICE, ServiceSpanData("redis")) == {}
 
 
 # --- metrics ---------------------------------------------------------------- #

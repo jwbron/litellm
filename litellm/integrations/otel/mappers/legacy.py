@@ -7,7 +7,7 @@ from litellm.integrations.otel.mappers.base import (
     SpanData,
     drop_none,
 )
-from litellm.integrations.otel.payloads import LLMCallSpanData
+from litellm.integrations.otel.payloads import LLMCallSpanData, ServiceSpanData
 from litellm.integrations.otel.spans import SpanRole
 
 # Deprecated keys (semconv-ai / Traceloop era).
@@ -20,17 +20,22 @@ _LEGACY_TOP_K: Final = "llm.top_k"
 _LEGACY_FREQUENCY_PENALTY: Final = "llm.frequency_penalty"
 _LEGACY_PRESENCE_PENALTY: Final = "llm.presence_penalty"
 _LEGACY_STOP_SEQUENCES: Final = "llm.chat.stop_sequences"
+# Service-span bare keys used by V1 (no namespace). Dual-emitted for any
+# dashboard that filters on them today.
+_LEGACY_SERVICE: Final = "service"
+_LEGACY_CALL_TYPE: Final = "call_type"
+_LEGACY_ERROR: Final = "error"
 
 
 class LegacyMapper:
-    """Re-emits LLM-call values under their deprecated key names."""
+    """Re-emits values under their deprecated key names (LLM-call + service)."""
 
     def map(self, role: SpanRole, data: SpanData) -> AttributeMap:
-        # Legacy vocabulary only ever covered LLM calls; isinstance narrows
-        # without needing ``cast``.
-        if not isinstance(data, LLMCallSpanData):
-            return {}
-        return self._llm_call(data)
+        if isinstance(data, LLMCallSpanData):
+            return self._llm_call(data)
+        if isinstance(data, ServiceSpanData):
+            return self._service(data)
+        return {}
 
     @staticmethod
     def _llm_call(data: LLMCallSpanData) -> AttributeMap:
@@ -49,3 +54,16 @@ class LegacyMapper:
                 _LEGACY_STOP_SEQUENCES: stop,
             }
         )
+
+    @staticmethod
+    def _service(data: ServiceSpanData) -> AttributeMap:
+        # V1 stamps these as bare keys (no namespace) on the service span.
+        attrs: AttributeMap = {_LEGACY_SERVICE: data.service_name}
+        if data.call_type is not None:
+            attrs[_LEGACY_CALL_TYPE] = data.call_type
+        if data.error is not None and data.error.message:
+            attrs[_LEGACY_ERROR] = data.error.message
+        # V1 stamps event_metadata sub-keys bare (under the user-supplied names).
+        for key, value in data.event_metadata.items():
+            attrs[key] = value
+        return attrs

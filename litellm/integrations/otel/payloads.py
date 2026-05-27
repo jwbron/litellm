@@ -180,15 +180,33 @@ class ServiceSpanData:
     service_name: str
     call_type: Optional[str] = None
     error: Optional[SpanError] = None
+    # Arbitrary caller-supplied attributes to stamp on the service span (V1
+    # contract: pass-through from ``async_service_*_hook(event_metadata=...)``).
+    # The mapper owns how these are namespaced (canonical: ``litellm.metadata.*``;
+    # legacy: bare keys to match V1).
+    event_metadata: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
-    def from_payload(cls, payload: "ServiceLoggerPayload") -> "ServiceSpanData":
+    def from_payload(
+        cls,
+        payload: "ServiceLoggerPayload",
+        event_metadata: Optional[Mapping[str, object]] = None,
+    ) -> "ServiceSpanData":
         # ``payload.service`` is a ``ServiceTypes(str, Enum)`` and ``error`` is
         # ``Optional[str]`` on the Pydantic model — no defensive reads needed.
+        coerced: Dict[str, str] = {}
+        for key, value in (event_metadata or {}).items():
+            if value is None:
+                coerced[key] = "None"
+            elif isinstance(value, (str, bool, int, float)):
+                coerced[key] = str(value)
+            else:
+                coerced[key] = str(value)
         return cls(
             service_name=payload.service.value,
             call_type=payload.call_type,
             error=SpanError(message=payload.error) if payload.error else None,
+            event_metadata=coerced,
         )
 
 
