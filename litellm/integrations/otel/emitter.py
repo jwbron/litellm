@@ -23,7 +23,7 @@ from litellm.integrations.otel.spans import (
 def default_mappers(config: OpenTelemetryV2Config) -> List[AttributeMapper]:
     """The canonical mapper chain: GenAI always; Legacy during the dual-emit window."""
     mappers: List[AttributeMapper] = [GenAIMapper()]
-    if config.legacy_compat:
+    if config.legacy_compat:what r
         mappers.append(LegacyMapper())
     return mappers
 
