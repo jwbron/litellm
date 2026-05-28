@@ -30,6 +30,13 @@ class CacheControlSupportedModels(str, Enum):
     MINIMAX = "minimax"
     GLM = "glm"
     ZAI = "z-ai"
+    # OpenRouter natively supports cache_control content blocks for Qwen and
+    # DeepSeek upstreams. See
+    # https://openrouter.ai/docs/features/prompt-caching. Without these the
+    # handler strips cache_control before the upstream call, so every turn
+    # pays full input rate (cache_read discount never applies).
+    QWEN = "qwen"
+    DEEPSEEK = "deepseek"
 
 
 class OpenrouterConfig(OpenAIGPTConfig):

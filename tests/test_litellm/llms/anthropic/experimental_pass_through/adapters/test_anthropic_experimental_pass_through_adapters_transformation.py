@@ -2472,3 +2472,55 @@ def test_translate_anthropic_tool_choice_none():
 
     result = adapter.translate_anthropic_tool_choice_to_openai({"type": "none"})
     assert result == "none"
+
+
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        ("anthropic/claude-sonnet-4", True),
+        ("claude-3-5-sonnet", True),
+        ("openrouter/qwen/qwen3-max", True),
+        ("openrouter/deepseek/deepseek-v3", True),
+        ("openrouter/openai/gpt-4o", False),
+        ("gemini/gemini-1.5-pro", False),
+    ],
+)
+def test_is_anthropic_claude_model_includes_qwen_and_deepseek(model, expected):
+    """
+    cache_control passthrough in the Anthropic->OpenAI adapter is gated on
+    is_anthropic_claude_model. Qwen and DeepSeek upstreams support
+    cache_control on OpenRouter, so they must be recognized here.
+    """
+    assert LiteLLMAnthropicMessagesAdapter.is_anthropic_claude_model(model) is expected
+
+
+def test_add_system_message_filters_billing_header_block():
+    """
+    The `x-anthropic-billing-header:` system block carries a per-request hash
+    that invalidates the upstream prefix cache on every turn. It must be
+    dropped during the Anthropic->OpenAI system-block translation, mirroring
+    _filter_billing_headers_from_system in the messages adapter.
+    """
+    adapter = LiteLLMAnthropicMessagesAdapter()
+    new_messages: list = []
+    request = {
+        "model": "openrouter/qwen/qwen3-max",
+        "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cch=abcde"},
+            {
+                "type": "text",
+                "text": "You are a helpful assistant.",
+                "cache_control": {"type": "ephemeral"},
+            },
+        ],
+    }
+
+    adapter._add_system_message_to_messages(new_messages, cast(Any, request))
+
+    assert len(new_messages) == 1
+    content = new_messages[0]["content"]
+    texts = [block["text"] for block in content]
+    assert "You are a helpful assistant." in texts
+    assert all(not t.startswith("x-anthropic-billing-header:") for t in texts)
+    # cache_control survives for qwen (gated by is_anthropic_claude_model)
+    assert any(block.get("cache_control") for block in content)
