@@ -30,6 +30,13 @@ class CacheControlSupportedModels(str, Enum):
     MINIMAX = "minimax"
     GLM = "glm"
     ZAI = "z-ai"
+    # OpenRouter's Alibaba (Qwen) upstreams require explicit cache_control
+    # content blocks. See https://openrouter.ai/docs/features/prompt-caching.
+    # Without this the handler strips cache_control before the upstream call,
+    # so every turn pays full input rate (cache_read discount never applies).
+    # DeepSeek is intentionally omitted: its caching is automatic/prefix-based
+    # and ignores cache_control, so listing it here would be inert.
+    QWEN = "qwen"
 
 
 class OpenrouterConfig(OpenAIGPTConfig):

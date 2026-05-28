@@ -717,7 +717,11 @@ class LiteLLMAnthropicMessagesAdapter:
         - vertex_ai/*claude* models
         """
         model_lower = model.lower()
-        return "anthropic" in model_lower or "claude" in model_lower
+        return (
+            "anthropic" in model_lower
+            or "claude" in model_lower
+            or "qwen" in model_lower
+        )
 
     @staticmethod
     def translate_thinking_for_model(
@@ -951,9 +955,20 @@ class LiteLLMAnthropicMessagesAdapter:
             model_name = anthropic_message_request.get("model", "")
             for block in system_content:
                 if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text", "")
+                    # Drop the `x-anthropic-billing-header:` system block.
+                    # Some clients (e.g. Claude Code) inject this block ahead
+                    # of the cache_control marker with a per-request hash; left
+                    # in place it invalidates the upstream prefix-cache key on
+                    # every turn, so cache_read_input_tokens stays 0. The
+                    # sibling messages/transformation.py path already filters it
+                    # via _filter_billing_headers_from_system; this adapter path
+                    # missed it.
+                    if text.startswith("x-anthropic-billing-header:"):
+                        continue
                     text_block: Dict[str, Any] = {
                         "type": "text",
-                        "text": block.get("text", ""),
+                        "text": text,
                     }
                     self._add_cache_control_if_applicable(block, text_block, model_name)
                     openai_system_content.append(text_block)
