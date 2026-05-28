@@ -553,3 +553,63 @@ def test_openrouter_non_reasoning_models_do_not_add_reasoning_effort():
     )
 
     assert "reasoning_effort" not in supported_params
+
+
+def test_openrouter_transform_request_with_cache_control_qwen():
+    """
+    Alibaba (Qwen) upstreams require explicit cache_control breakpoints on
+    OpenRouter, so transform_request must preserve the marker (move it to a
+    content block) rather than stripping it. Without this every turn pays
+    full input rate.
+    """
+    config = OpenrouterConfig()
+
+    messages = [
+        {
+            "role": "user",
+            "content": "Analyze this data",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+    transformed_request = config.transform_request(
+        model="openrouter/qwen/qwen3-max",
+        messages=messages,
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+
+    user_message = transformed_request["messages"][0]
+    assert isinstance(user_message["content"], list)
+    assert user_message["content"][0]["type"] == "text"
+    assert user_message["content"][0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_openrouter_transform_request_drops_cache_control_for_deepseek():
+    """
+    DeepSeek caching on OpenRouter is automatic/prefix-based and ignores
+    cache_control, so DeepSeek is intentionally absent from
+    CacheControlSupportedModels. The handler should strip the marker rather
+    than emit an inert cache_control content block.
+    """
+    config = OpenrouterConfig()
+
+    messages = [
+        {
+            "role": "user",
+            "content": "Analyze this data",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+    transformed_request = config.transform_request(
+        model="openrouter/deepseek/deepseek-v3",
+        messages=messages,
+        optional_params={},
+        litellm_params={},
+        headers={},
+    )
+
+    user_message = transformed_request["messages"][0]
+    assert "cache_control" not in user_message
