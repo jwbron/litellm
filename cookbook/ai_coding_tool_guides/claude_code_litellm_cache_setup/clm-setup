@@ -556,9 +556,13 @@ write_block_hook() {
 # server-tool schemas are stripped by drop_params and silently no-op).
 # Redirect the model to the DDG MCP tools instead.
 if [[ -z "$ANTHROPIC_CUSTOM_MODEL_OPTION" ]]; then
-  printf '{"decision":"allow"}\n'; exit 0
+  # First-party Claude route: built-in tools are live. No decision to report;
+  # let the call continue through the normal permission flow.
+  exit 0
 fi
-printf '{"decision":"block","reason":"WebSearch and WebFetch do not work in this session. Use mcp__ddg__search instead of WebSearch, and mcp__ddg__fetch_content instead of WebFetch. Retry your operation with those tools."}'
+
+# LiteLLM route: deny with a hint so the model picks the DDG MCP tools.
+printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"WebSearch and WebFetch do not work in this session. Use mcp__ddg__search instead of WebSearch, and mcp__ddg__fetch_content instead of WebFetch. Retry your operation with those tools."}}'
 exit 0
 EOF
   chmod +x "$HOOKS_DIR/block-builtin-web-tools.sh"
