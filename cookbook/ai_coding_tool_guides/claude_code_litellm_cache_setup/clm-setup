@@ -359,11 +359,22 @@ EOF
 
 # ---------- run wrapper (shared by systemd + launchd) ----------
 write_run_wrapper() {
-  cat > "$RUN_WRAPPER" <<EOF
+  # Emitted with a quoted heredoc so NOTHING expands at generation time:
+  # the wrapper resolves its own paths at runtime, making it portable across
+  # users/hosts (the committed copy carries no machine-specific absolute path).
+  cat > "$RUN_WRAPPER" <<'EOF'
 #!/usr/bin/env bash
 # Managed by clm-setup. Sources the env file, sets PYTHONPATH so the cost
-# callback imports, and execs the proxy on loopback.
+# callback imports, and execs the proxy on loopback. Paths resolve at runtime
+# (no baked-in $HOME) so this wrapper is portable across users/hosts.
 set -euo pipefail
+# This wrapper lives in the config dir; resolve siblings relative to it.
+CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$CONFIG_DIR/litellm.env"
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+PORT="${LITELLM_PORT:-4000}"
+# Prefer a litellm on PATH; fall back to the user-level uv tool location.
+LITELLM_BIN="${CLM_LITELLM_BIN:-$(command -v litellm || echo "$HOME/.local/bin/litellm")}"
 set -a
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 set +a
@@ -371,7 +382,7 @@ set +a
 # proxy discards Claude Code's bearer instead of 400ing on a mismatch.
 unset LITELLM_MASTER_KEY
 export PYTHONPATH="$CONFIG_DIR"
-exec "$BIN_DIR/litellm" --config "$CONFIG_FILE" --host 127.0.0.1 --port $PORT
+exec "$LITELLM_BIN" --config "$CONFIG_FILE" --host 127.0.0.1 --port "$PORT"
 EOF
   chmod +x "$RUN_WRAPPER"
   ok "wrote $RUN_WRAPPER"
@@ -381,7 +392,9 @@ EOF
 setup_service_linux() {
   local unit_dir="$HOME/.config/systemd/user"
   mkdir -p "$unit_dir"
-  cat > "$unit_dir/litellm.service" <<EOF
+  # Use systemd's %h (user home) specifier rather than an expanded absolute
+  # path, so the committed unit is portable across users/hosts.
+  cat > "$unit_dir/litellm.service" <<'EOF'
 [Unit]
 Description=LiteLLM proxy (host-side, routes Claude Code at non-Claude models)
 After=network-online.target
@@ -389,7 +402,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$RUN_WRAPPER
+ExecStart=%h/.config/litellm/run-litellm.sh
 Restart=on-failure
 RestartSec=5
 
