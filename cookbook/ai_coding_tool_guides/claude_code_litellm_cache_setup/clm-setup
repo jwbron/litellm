@@ -1,0 +1,702 @@
+#!/usr/bin/env bash
+# clm-setup — one-shot setup for the LiteLLM proxy + Claude Code routing.
+#
+# Bootstraps, on a fresh Fedora/Linux or macOS box, the full stack that
+# lets Claude Code drive non-Claude models (Qwen/DeepSeek via OpenRouter)
+# while real Claude traffic keeps going straight to api.anthropic.com:
+#
+#   1. uv (user-level, no sudo) if missing
+#   2. litellm[proxy] from the jwbron/litellm fork, pinned to the commit
+#      that carries the cache_control passthrough patches (PR #1). This
+#      replaces the old patch-and-restart `relitellm` dance — the patches
+#      are baked into the build.
+#   3. ~/.config/litellm/litellm.env  (OPENROUTER_API_KEY; no master key
+#      on purpose -> proxy runs in no-auth dev mode, loopback-only)
+#   4. ~/.config/litellm/cost_callback.py  (per-session cost + cache stats)
+#   5. ~/.config/litellm/config.yaml  -- generated INTERACTIVELY
+#   6. a run wrapper + a service:
+#        Linux -> systemd --user unit
+#        macOS -> launchd LaunchAgent
+#   7. ~/.local/bin/cllm  (+ clm symlink) -- the Claude Code launcher
+#   8. harness extras: a plain statusline (cost + cache %), the DuckDuckGo
+#      MCP wrapper, the WebSearch/WebFetch block hook, and the settings.json
+#      / .claude.json wiring for them.
+#
+# Re-runnable. Existing config.yaml / env / settings are detected and you
+# are asked before anything is overwritten. Set CLM_DEFAULTS=1 to skip the
+# interactive model prompts and seed the three recommended models.
+set -euo pipefail
+
+# ---- pinned fork build (jwbron/litellm main @ PR #2 merge) ----
+LITELLM_FORK_COMMIT="ba6489cf2e9df3baf304bc34edc6569146d5ee36"
+LITELLM_SPEC="litellm[proxy] @ git+https://github.com/jwbron/litellm@${LITELLM_FORK_COMMIT}"
+PORT="${LITELLM_PORT:-4000}"
+
+CONFIG_DIR="$HOME/.config/litellm"
+STATE_DIR="$HOME/.local/state/clm"
+BIN_DIR="$HOME/.local/bin"
+CLAUDE_DIR="$HOME/.claude"
+HOOKS_DIR="$CLAUDE_DIR/hooks"
+ENV_FILE="$CONFIG_DIR/litellm.env"
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+RUN_WRAPPER="$CONFIG_DIR/run-litellm.sh"
+
+# ---------- pretty output ----------
+c_blue=$'\e[34m'; c_grn=$'\e[32m'; c_yel=$'\e[33m'; c_red=$'\e[31m'; c_rst=$'\e[0m'
+log()  { printf '%s==>%s %s\n' "$c_blue" "$c_rst" "$*"; }
+ok()   { printf '%s ok %s %s\n' "$c_grn"  "$c_rst" "$*"; }
+warn() { printf '%swarn%s %s\n' "$c_yel"  "$c_rst" "$*" >&2; }
+die()  { printf '%sERR %s %s\n' "$c_red"  "$c_rst" "$*" >&2; exit 1; }
+confirm() { # confirm "prompt" [default-y]  -> returns 0 for yes
+  local p="$1" d="${2:-y}" ans
+  if [[ "$d" == y ]]; then p="$p [Y/n] "; else p="$p [y/N] "; fi
+  read -r -p "$p" ans || true
+  ans="${ans:-$d}"
+  [[ "$ans" =~ ^[Yy] ]]
+}
+
+# ---------- OS detection ----------
+case "$(uname -s)" in
+  Linux)  OS=linux ;;
+  Darwin) OS=macos ;;
+  *) die "unsupported OS: $(uname -s) (linux/macos only)" ;;
+esac
+log "platform: $OS"
+
+# ---------- prerequisites ----------
+need_pkg() { # need_pkg <cmd> <fedora-pkg> <brew-pkg>
+  command -v "$1" >/dev/null 2>&1 && return 0
+  warn "missing '$1'. Install it, then re-run:"
+  if [[ $OS == macos ]]; then echo "    brew install $3"
+  else echo "    sudo dnf install -y $2"; fi
+  return 1
+}
+
+ensure_prereqs() {
+  local missing=0
+  need_pkg jq jq jq           || missing=1
+  need_pkg python3 python3 python || missing=1
+  need_pkg curl curl curl     || missing=1
+  (( missing )) && die "install the package(s) above and re-run"
+
+  if ! command -v uv >/dev/null 2>&1 && [[ ! -x "$BIN_DIR/uv" ]]; then
+    log "installing uv (user-level, no sudo)"
+    if [[ $OS == macos ]] && command -v brew >/dev/null 2>&1; then
+      brew install uv
+    else
+      # download installer to a file (not curl|sh) then run it
+      local tmp; tmp="$(mktemp)"
+      curl -fsSL https://astral.sh/uv/install.sh -o "$tmp"
+      sh "$tmp"
+      rm -f "$tmp"
+    fi
+  fi
+  UV="$(command -v uv || echo "$BIN_DIR/uv")"
+  [[ -x "$UV" ]] || die "uv not found after install"
+  ok "uv: $UV"
+}
+
+# ---------- litellm from the fork ----------
+install_litellm() {
+  log "installing litellm from fork (pinned ${LITELLM_FORK_COMMIT:0:10})"
+  "$UV" tool install --python 3.12 --force "$LITELLM_SPEC"
+  [[ -x "$BIN_DIR/litellm" ]] || die "litellm binary missing after install"
+  ok "litellm installed: $("$BIN_DIR/litellm" --version 2>/dev/null | head -1 || echo ok)"
+}
+
+# ---------- OPENROUTER_API_KEY / env file ----------
+find_existing_key() {
+  # echo an existing OPENROUTER_API_KEY from our env file or egg secrets
+  local f
+  for f in "$ENV_FILE" "$HOME/.config/egg/secrets.env"; do
+    [[ -f "$f" ]] || continue
+    local v; v="$(grep -E '^OPENROUTER_API_KEY=' "$f" 2>/dev/null | tail -1 | cut -d= -f2-)"
+    if [[ -n "$v" && "$v" != *placeholder* ]]; then echo "$v"; return 0; fi
+  done
+  return 1
+}
+
+setup_env_file() {
+  mkdir -p "$CONFIG_DIR"
+  local key
+  if key="$(find_existing_key)"; then
+    if confirm "Reuse the OPENROUTER_API_KEY already on this machine?" y; then
+      :
+    else key=""; fi
+  fi
+  if [[ -z "${key:-}" ]]; then
+    read -r -s -p "Enter OPENROUTER_API_KEY (input hidden): " key; echo
+    [[ -n "$key" ]] || die "OPENROUTER_API_KEY is required"
+  fi
+  # No master key on purpose: the proxy binds to 127.0.0.1 and runs in
+  # LiteLLM's no-auth dev mode, so Claude Code's bearer token is discarded
+  # and OPENROUTER_API_KEY is injected upstream from the model_list entry.
+  umask 077
+  cat > "$ENV_FILE" <<EOF
+# Managed by clm-setup. Loopback-only proxy in no-auth dev mode:
+# do NOT add LITELLM_MASTER_KEY here unless you also rebind off 127.0.0.1.
+OPENROUTER_API_KEY=$key
+EOF
+  umask 022
+  ok "wrote $ENV_FILE (0600)"
+}
+
+# ---------- cost_callback.py ----------
+write_cost_callback() {
+  cat > "$CONFIG_DIR/cost_callback.py" <<'PYEOF'
+"""LiteLLM custom logger: write authoritative OpenRouter cost per Claude
+Code session to ~/.local/state/clm/cost-<session_id>.json.
+
+Why: Anthropic's `/v1/messages` response shape has no `cost` field. The
+upstream OpenRouter response carries `usage.cost` (actual provider-billed
+cost), but it gets stripped when LiteLLM translates the response back to
+Anthropic format for Claude Code. We hook the proxy's post-call success
+path, pull the raw upstream JSON out of
+`litellm_logging_obj.model_call_details.original_response`, and persist
+the cost keyed by Claude Code's session_id (sent on every request as
+`x-claude-code-session-id`).
+
+Loaded via PYTHONPATH=~/.config/litellm + `callbacks: cost_callback.clm_cost_logger`.
+The standard log_success_event hooks don't fire for /v1/messages — that's
+why async_post_call_success_hook is the right seam.
+"""
+import json
+import threading
+from pathlib import Path
+
+from litellm.integrations.custom_logger import CustomLogger
+
+STATE_DIR = Path.home() / ".local/state/clm"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+_lock = threading.Lock()
+
+
+def _raw_upstream_usage(data):
+    try:
+        lo = data.get("litellm_logging_obj")
+        if lo is None:
+            return None
+        mcd = getattr(lo, "model_call_details", None) or {}
+        rr = mcd.get("original_response")
+        if isinstance(rr, str):
+            try:
+                rr = json.loads(rr.strip())
+            except Exception:
+                return None
+        if not isinstance(rr, dict):
+            return None
+        usage = rr.get("usage")
+        return usage if isinstance(usage, dict) else None
+    except Exception:
+        return None
+
+
+def _extract_cost(usage):
+    """Prefer OpenRouter's top-level `cost` (what they bill you); under
+    BYOK that field is zero, so fall back to
+    cost_details.upstream_inference_cost (what the upstream provider bills
+    for the same request)."""
+    u = usage or {}
+    cost = u.get("cost")
+    if isinstance(cost, (int, float)) and cost > 0:
+        return float(cost)
+    details = u.get("cost_details") or {}
+    upstream = details.get("upstream_inference_cost")
+    if isinstance(upstream, (int, float)) and upstream > 0:
+        return float(upstream)
+    return None
+
+
+def _extract_cache_stats(usage):
+    """(prompt_tokens, cached_input_tokens, cache_write_tokens,
+    reasoning_tokens), merging the competing provider schemas."""
+    u = usage or {}
+
+    def _num(x):
+        return float(x) if isinstance(x, (int, float)) else 0.0
+
+    prompt = _num(u.get("prompt_tokens"))
+    pdet = u.get("prompt_tokens_details") or {}
+    cached = _num(u.get("cache_read_input_tokens")) or _num(pdet.get("cached_tokens"))
+    cache_write = _num(u.get("cache_creation_input_tokens")) or _num(
+        pdet.get("cache_write_tokens")
+    )
+    cdet = u.get("completion_tokens_details") or {}
+    reasoning = _num(cdet.get("reasoning_tokens"))
+    return prompt, cached, cache_write, reasoning
+
+
+def _extract_session_id(data):
+    try:
+        headers = ((data.get("proxy_server_request") or {}).get("headers")) or {}
+        sid = headers.get("x-claude-code-session-id")
+        return sid or None
+    except Exception:
+        return None
+
+
+class ClmCostLogger(CustomLogger):
+    async def async_post_call_success_hook(self, data, user_api_key_dict, response):
+        try:
+            if not isinstance(data, dict):
+                return response
+            usage = _raw_upstream_usage(data)
+            sid = _extract_session_id(data)
+            if not sid:
+                return response
+            cost = _extract_cost(usage)
+            prompt, cached, cache_write, reasoning = _extract_cache_stats(usage)
+            if cost is None and prompt == 0 and cached == 0:
+                return response
+            cost = cost or 0.0
+            f = STATE_DIR / f"cost-{sid}.json"
+            with _lock:
+                try:
+                    existing = json.loads(f.read_text())
+                except Exception:
+                    existing = {}
+                existing["cost"] = existing.get("cost", 0.0) + cost
+                existing["calls"] = existing.get("calls", 0) + 1
+                existing["prompt_tokens"] = existing.get("prompt_tokens", 0.0) + prompt
+                existing["cached_tokens"] = existing.get("cached_tokens", 0.0) + cached
+                existing["cache_write_tokens"] = (
+                    existing.get("cache_write_tokens", 0.0) + cache_write
+                )
+                existing["reasoning_tokens"] = (
+                    existing.get("reasoning_tokens", 0.0) + reasoning
+                )
+                f.write_text(json.dumps(existing))
+        except Exception:
+            pass
+        return response
+
+
+clm_cost_logger = ClmCostLogger()
+PYEOF
+  ok "wrote $CONFIG_DIR/cost_callback.py"
+}
+
+# ---------- interactive config.yaml ----------
+emit_model() { # emit_model <friendly> <openrouter_id> <provider|""> <reasoning_effort|"">
+  local name="$1" orid="$2" prov="$3" effort="$4" suffix
+  for suffix in "" "[1m]"; do
+    cat <<EOF
+  - model_name: ${name}${suffix}
+    litellm_params:
+      model: openrouter/${orid}
+      api_key: os.environ/OPENROUTER_API_KEY
+      drop_params: true
+EOF
+    [[ -n "$effort" ]] && echo "      reasoning_effort: ${effort}"
+    if [[ -n "$prov" ]]; then
+      cat <<EOF
+      extra_body:
+        provider:
+          order: [${prov}]
+          allow_fallbacks: false
+EOF
+    fi
+  done
+}
+
+generate_config() {
+  if [[ -f "$CONFIG_FILE" ]] && ! confirm "config.yaml exists. Regenerate it?" n; then
+    ok "keeping existing $CONFIG_FILE"
+    return 0
+  fi
+
+  local tmp; tmp="$(mktemp)"
+  cat > "$tmp" <<'EOF'
+# Host-side LiteLLM proxy — routes Claude Code at non-Claude models.
+# Real Claude traffic (opus/sonnet/haiku) does NOT pass through here;
+# Claude Code talks to api.anthropic.com directly via OAuth.
+#
+# Each model has a friendly entry plus a defensive `[1m]` alias (the cllm
+# wrapper appends `[1m]` to opt into Claude Code's 1M-context math; a few
+# startup probes leak the suffix through, and the alias absorbs them).
+# Provider routing is pinned per model so the cache surface is stable;
+# allow_fallbacks:false fails rather than silently routing to a peer that
+# doesn't cache. Generated by clm-setup.
+
+model_list:
+EOF
+
+  if [[ "${CLM_DEFAULTS:-0}" == 1 ]] || confirm "Seed the three recommended models (qwen3.7-max, deepseek-v4-flash, deepseek-v4-pro)?" y; then
+    emit_model "qwen3.7-max"      "qwen/qwen3.7-max"        "Alibaba"  "high" >> "$tmp"
+    emit_model "deepseek-v4-flash" "deepseek/deepseek-v4-flash" "DeepSeek" ""    >> "$tmp"
+    emit_model "deepseek-v4-pro"   "deepseek/deepseek-v4-pro"   "DeepSeek" "high" >> "$tmp"
+    ok "seeded 3 default models"
+  fi
+
+  if [[ "${CLM_DEFAULTS:-0}" != 1 ]]; then
+    while confirm "Add another model?" n; do
+      local name orid prov effort
+      read -r -p "  friendly name (e.g. qwen3-coder): " name
+      read -r -p "  openrouter model id (e.g. qwen/qwen3-coder): " orid
+      read -r -p "  pin provider (e.g. Alibaba; blank = no pin): " prov
+      if confirm "  enable reasoning_effort: high?" n; then effort="high"; else effort=""; fi
+      [[ -n "$name" && -n "$orid" ]] || { warn "name and model id required; skipped"; continue; }
+      emit_model "$name" "$orid" "$prov" "$effort" >> "$tmp"
+      ok "added $name"
+    done
+  fi
+
+  cat >> "$tmp" <<'EOF'
+
+litellm_settings:
+  # Per-session cost + cache stats -> ~/.local/state/clm/cost-<sid>.json.
+  # Loaded via PYTHONPATH=~/.config/litellm (set by the run wrapper).
+  callbacks: cost_callback.clm_cost_logger
+
+# No master_key on purpose: loopback-only no-auth dev mode. Claude Code's
+# bearer is discarded; OPENROUTER_API_KEY is injected upstream from each
+# model_list entry. If you ever rebind off 127.0.0.1, restore master_key.
+EOF
+
+  mv "$tmp" "$CONFIG_FILE"
+  ok "wrote $CONFIG_FILE"
+}
+
+# ---------- run wrapper (shared by systemd + launchd) ----------
+write_run_wrapper() {
+  # Emitted with a quoted heredoc so NOTHING expands at generation time:
+  # the wrapper resolves its own paths at runtime, making it portable across
+  # users/hosts (the committed copy carries no machine-specific absolute path).
+  cat > "$RUN_WRAPPER" <<'EOF'
+#!/usr/bin/env bash
+# Managed by clm-setup. Sources the env file, sets PYTHONPATH so the cost
+# callback imports, and execs the proxy on loopback. Paths resolve at runtime
+# (no baked-in $HOME) so this wrapper is portable across users/hosts.
+set -euo pipefail
+# This wrapper lives in the config dir; resolve siblings relative to it.
+CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$CONFIG_DIR/litellm.env"
+CONFIG_FILE="$CONFIG_DIR/config.yaml"
+PORT="${LITELLM_PORT:-4000}"
+# Prefer a litellm on PATH; fall back to the user-level uv tool location.
+LITELLM_BIN="${CLM_LITELLM_BIN:-$(command -v litellm || echo "$HOME/.local/bin/litellm")}"
+set -a
+[ -f "$ENV_FILE" ] && . "$ENV_FILE"
+set +a
+# Force no-auth dev mode: drop any inherited master key so the loopback
+# proxy discards Claude Code's bearer instead of 400ing on a mismatch.
+unset LITELLM_MASTER_KEY
+export PYTHONPATH="$CONFIG_DIR"
+exec "$LITELLM_BIN" --config "$CONFIG_FILE" --host 127.0.0.1 --port "$PORT"
+EOF
+  chmod +x "$RUN_WRAPPER"
+  ok "wrote $RUN_WRAPPER"
+}
+
+# ---------- service ----------
+setup_service_linux() {
+  local unit_dir="$HOME/.config/systemd/user"
+  mkdir -p "$unit_dir"
+  # Use systemd's %h (user home) specifier rather than an expanded absolute
+  # path, so the committed unit is portable across users/hosts.
+  cat > "$unit_dir/litellm.service" <<'EOF'
+[Unit]
+Description=LiteLLM proxy (host-side, routes Claude Code at non-Claude models)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.config/litellm/run-litellm.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable litellm.service
+  systemctl --user restart litellm.service
+  ok "systemd unit installed + (re)started"
+}
+
+setup_service_macos() {
+  local agent_dir="$HOME/Library/LaunchAgents"
+  local plist="$agent_dir/com.jwbron.litellm.plist"
+  mkdir -p "$agent_dir" "$STATE_DIR"
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>            <string>com.jwbron.litellm</string>
+  <key>ProgramArguments</key> <array><string>$RUN_WRAPPER</string></array>
+  <key>RunAtLoad</key>        <true/>
+  <key>KeepAlive</key>        <true/>
+  <key>StandardOutPath</key>  <string>$STATE_DIR/litellm.out.log</string>
+  <key>StandardErrorPath</key><string>$STATE_DIR/litellm.err.log</string>
+</dict>
+</plist>
+EOF
+  launchctl unload "$plist" 2>/dev/null || true
+  launchctl load -w "$plist"
+  ok "launchd agent installed + loaded ($plist)"
+}
+
+setup_service() {
+  write_run_wrapper
+  if [[ $OS == linux ]]; then setup_service_linux; else setup_service_macos; fi
+}
+
+# ---------- cllm launcher ----------
+write_cllm() {
+  cat > "$BIN_DIR/cllm" <<'EOF'
+#!/usr/bin/env bash
+# cllm — invoke Claude Code routed through the host LiteLLM proxy.
+# For non-Claude models only:  cllm --model qwen3.7-max …
+# Plain `claude` still goes direct to api.anthropic.com via OAuth.
+set -euo pipefail
+
+export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-http://127.0.0.1:4000}"
+# Skip OAuth; the proxy runs in no-auth dev mode and discards the credential.
+export ANTHROPIC_AUTH_METHOD="api_key"
+
+friendly=""
+args=()
+while (( $# )); do
+  case "$1" in
+    -m|--model)
+      [[ -z "${2:-}" ]] && { echo "cllm: $1 requires a model name" >&2; exit 1; }
+      friendly="${2%\[1m\]}"; shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+if [[ -n "$friendly" ]]; then
+  full="${friendly}[1m]"   # opt into Claude Code's 1M-context compaction math
+  export ANTHROPIC_CUSTOM_MODEL_OPTION="$full"
+  export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="$friendly"
+  # Force subagents onto the same backend (their haiku/sonnet/opus
+  # frontmatter isn't in the model_list and would 400).
+  export CLAUDE_CODE_SUBAGENT_MODEL="$full"
+  # Disable Claude-only harness capabilities (thinking, effort tiers, …) —
+  # no upstream representation on qwen/deepseek.
+  export ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES=""
+  # Qwen/DeepSeek drift to Chinese in long sessions; anchor the language.
+  args+=(--append-system-prompt "Always respond in English. Code language and reasoning context do not change response language.")
+  args+=(--model "$full")
+fi
+
+exec claude "${args[@]}"
+EOF
+  chmod +x "$BIN_DIR/cllm"
+  ln -sf cllm "$BIN_DIR/clm"
+  ok "wrote $BIN_DIR/cllm (+ clm symlink)"
+}
+
+# ---------- harness extras ----------
+write_statusline() {
+  local sl="$CLAUDE_DIR/statusline.sh"
+  local marker="clm-setup:managed-statusline"
+  # Never clobber a user's own statusline. The default we write carries the
+  # marker below; anything without it (e.g. your styled one) is left alone.
+  # Delete the marker line from the managed file to "adopt" it and keep your
+  # edits across re-runs.
+  if [[ -f "$sl" ]] && ! grep -q "$marker" "$sl"; then
+    ok "keeping your custom statusline ($sl) — not overwriting"
+    return 0
+  fi
+  cat > "$sl" <<'EOF'
+#!/usr/bin/env bash
+# clm-setup:managed-statusline (delete this line to keep your edits on re-run)
+# Plain Claude Code statusline. For LiteLLM-routed sessions it splices in
+# the authoritative OpenRouter cost + cache-hit rate that the proxy's
+# cost_callback persists to ~/.local/state/clm/cost-<sid>.json. Keys off
+# that file's existence, so it works for any model and leaves real Claude
+# sessions (which never produce the file) showing Claude Code's own cost.
+set -u
+payload=$(cat)
+model=$(jq   -r '.model.display_name // "Claude"'        <<<"$payload" 2>/dev/null)
+session_id=$(jq -r '.session_id // ""'                   <<<"$payload" 2>/dev/null)
+cwd=$(jq     -r '.workspace.current_dir // .cwd // ""'   <<<"$payload" 2>/dev/null)
+cost=$(jq    -r '.cost.total_cost_usd // empty'          <<<"$payload" 2>/dev/null)
+ctx=$(jq     -r '.context_window.used_percentage // empty' <<<"$payload" 2>/dev/null)
+
+cache_pct=""
+cost_file="$HOME/.local/state/clm/cost-${session_id}.json"
+if [[ -n $session_id && -f $cost_file ]]; then
+  fc=$(jq -r '.cost // empty' "$cost_file" 2>/dev/null)
+  if [[ -n $fc ]]; then cost=$fc; else cost=""; fi
+  cache_pct=$(jq -r '
+    if (.prompt_tokens // 0) > 0
+    then ((.cached_tokens // 0) * 100 / .prompt_tokens | floor)
+    else empty end' "$cost_file" 2>/dev/null)
+fi
+
+short="${cwd/#$HOME/\~}"
+out="$model  $short"
+[[ -n $ctx ]] && out+="  ctx $(printf '%.0f' "$ctx")%"
+if [[ -n $cost ]]; then
+  if awk "BEGIN { exit !($cost < 0.01) }" 2>/dev/null; then
+    out+="  $(printf '$%.4f' "$cost")"
+  else
+    out+="  $(printf '$%.2f' "$cost")"
+  fi
+  [[ -n $cache_pct ]] && out+=" ⚡${cache_pct}%"
+fi
+printf '%s' "$out"
+EOF
+  chmod +x "$CLAUDE_DIR/statusline.sh"
+  ok "wrote $CLAUDE_DIR/statusline.sh"
+}
+
+write_ddg_wrapper() {
+  cat > "$BIN_DIR/ddg-mcp-wrapper" <<'EOF'
+#!/bin/bash
+# Conditional DuckDuckGo MCP server: active only on the LiteLLM route
+# (ANTHROPIC_CUSTOM_MODEL_OPTION set). On first-party Claude it exits
+# cleanly so built-in WebSearch/WebFetch stay available.
+if [[ -n "$ANTHROPIC_CUSTOM_MODEL_OPTION" ]]; then
+  exec uvx duckduckgo-mcp-server "$@"
+else
+  exit 0
+fi
+EOF
+  chmod +x "$BIN_DIR/ddg-mcp-wrapper"
+  ok "wrote $BIN_DIR/ddg-mcp-wrapper"
+}
+
+write_block_hook() {
+  mkdir -p "$HOOKS_DIR"
+  cat > "$HOOKS_DIR/block-builtin-web-tools.sh" <<'EOF'
+#!/bin/bash
+# Block built-in WebSearch/WebFetch on the LiteLLM route (their Anthropic
+# server-tool schemas are stripped by drop_params and silently no-op).
+# Redirect the model to the DDG MCP tools instead.
+if [[ -z "$ANTHROPIC_CUSTOM_MODEL_OPTION" ]]; then
+  # First-party Claude route: built-in tools are live. No decision to report;
+  # let the call continue through the normal permission flow.
+  exit 0
+fi
+
+# LiteLLM route: deny with a hint so the model picks the DDG MCP tools.
+printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"WebSearch and WebFetch do not work in this session. Use mcp__ddg__search instead of WebSearch, and mcp__ddg__fetch_content instead of WebFetch. Retry your operation with those tools."}}'
+exit 0
+EOF
+  chmod +x "$HOOKS_DIR/block-builtin-web-tools.sh"
+  ok "wrote $HOOKS_DIR/block-builtin-web-tools.sh"
+}
+
+patch_claude_settings() {
+  # Idempotently add statusLine + the WebSearch/WebFetch block hooks to
+  # ~/.claude/settings.json without disturbing other keys.
+  python3 - "$CLAUDE_DIR/settings.json" <<'PYEOF'
+import json, os, sys
+p = sys.argv[1]
+os.makedirs(os.path.dirname(p), exist_ok=True)
+if os.path.exists(p):
+    try:
+        d = json.load(open(p))
+    except Exception as e:
+        sys.exit("refusing to overwrite unparseable %s: %s" % (p, e))
+else:
+    d = {}
+# Only set a statusLine when none exists — never clobber an existing one
+# (preserves a user's command path, padding, and any other fields).
+d.setdefault("statusLine", {"type": "command", "command": "$HOME/.claude/statusline.sh"})
+hooks = d.setdefault("hooks", {})
+pre = hooks.setdefault("PreToolUse", [])
+cmd = "$HOME/.claude/hooks/block-builtin-web-tools.sh"
+for matcher in ("WebSearch", "WebFetch"):
+    if any(e.get("matcher") == matcher
+           and any(h.get("command") == cmd for h in e.get("hooks", []))
+           for e in pre):
+        continue
+    pre.append({"matcher": matcher,
+                "hooks": [{"type": "command", "command": cmd}]})
+json.dump(d, open(p, "w"), indent=2)
+print("patched", p)
+PYEOF
+  ok "patched $CLAUDE_DIR/settings.json (statusLine + web-tool hooks)"
+}
+
+patch_claude_mcp() {
+  # Register the ddg stdio MCP server in ~/.claude.json, preserving state.
+  python3 - "$HOME/.claude.json" "$BIN_DIR/ddg-mcp-wrapper" <<'PYEOF'
+import json, os, sys
+p, wrapper = sys.argv[1], sys.argv[2]
+if os.path.exists(p):
+    try:
+        d = json.load(open(p))
+    except Exception as e:
+        sys.exit("refusing to overwrite unparseable %s: %s" % (p, e))
+else:
+    d = {}
+d.setdefault("mcpServers", {})["ddg"] = {
+    "type": "stdio",
+    "command": wrapper,
+    "args": [],
+    "env": {"DDG_SAFE_SEARCH": "MODERATE"},
+}
+json.dump(d, open(p, "w"), indent=2)
+print("registered ddg in", p)
+PYEOF
+  ok "registered ddg MCP server in ~/.claude.json"
+}
+
+setup_harness_extras() {
+  write_statusline
+  write_ddg_wrapper
+  write_block_hook
+  patch_claude_settings
+  patch_claude_mcp
+}
+
+# ---------- health check ----------
+health_check() {
+  log "waiting for proxy on 127.0.0.1:$PORT"
+  for _ in $(seq 1 20); do
+    if curl -fsS "http://127.0.0.1:$PORT/health/liveliness" >/dev/null 2>&1; then
+      ok "proxy is live"
+      return 0
+    fi
+    sleep 1
+  done
+  warn "proxy did not answer /health/liveliness in 20s"
+  if [[ $OS == linux ]]; then
+    echo "  logs: journalctl --user -u litellm.service -n 40 --no-pager"
+  else
+    echo "  logs: tail -n 40 $STATE_DIR/litellm.err.log"
+  fi
+  return 1
+}
+
+# ---------- main ----------
+main() {
+  mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$BIN_DIR" "$CLAUDE_DIR" "$HOOKS_DIR"
+  ensure_prereqs
+  install_litellm
+  setup_env_file
+  write_cost_callback
+  generate_config
+  setup_service
+  write_cllm
+  setup_harness_extras
+  health_check || true
+
+  cat <<EOF
+
+${c_grn}Done.${c_rst} LiteLLM proxy + Claude Code routing are set up.
+
+  Launch a routed session:   cllm --model qwen3.7-max
+  Plain Claude (unchanged):  claude
+  Proxy health:              curl http://127.0.0.1:$PORT/health/liveliness
+EOF
+  if [[ $OS == linux ]]; then
+    echo "  Restart proxy:             systemctl --user restart litellm.service"
+  else
+    echo "  Restart proxy:             launchctl kickstart -k gui/\$(id -u)/com.jwbron.litellm"
+  fi
+  cat <<EOF
+
+  Make sure $BIN_DIR is on your PATH.
+  Note: settings.json / .claude.json were edited — restart Claude Code to pick them up.
+EOF
+}
+
+main "$@"
