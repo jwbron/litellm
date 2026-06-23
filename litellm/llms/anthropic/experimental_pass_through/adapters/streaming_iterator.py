@@ -128,13 +128,9 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                 )
 
                 if should_start_new_block and not self.sent_content_block_finish:
-                    # Queue the sequence: content_block_stop -> content_block_start
-                    # For text blocks the trigger chunk is not emitted as a separate
-                    # delta because content_block_start carries the information.
-                    # For tool_use blocks we must also emit the trigger chunk's delta
-                    # when it carries input_json_delta data, because some providers
-                    # (e.g. xAI, Gemini) include tool arguments in the same streaming
-                    # chunk as the function name/id.
+                    # Queue the sequence: content_block_stop -> content_block_start,
+                    # then re-queue the trigger chunk's delta when it carries payload
+                    # the new content_block_start doesn't already include (see step 3).
 
                     # 1. Stop current content block
                     self.chunk_queue.append(
@@ -153,15 +149,39 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                         }
                     )
 
-                    # 3. If the trigger chunk carries tool argument data, queue it
-                    # so the input_json_delta is not silently dropped.
-                    if (
-                        processed_chunk.get("type") == "content_block_delta"
-                        and isinstance(processed_chunk.get("delta"), dict)
-                        and processed_chunk["delta"].get("type") == "input_json_delta"
-                        and processed_chunk["delta"].get("partial_json")
+                    # 3. If the trigger chunk itself carries delta payload not
+                    # already embedded in the new content_block_start, queue it
+                    # so the first delta of the block isn't silently dropped:
+                    # - input_json_delta: some providers (e.g. xAI, Gemini)
+                    #   include tool arguments in the same streaming chunk as
+                    #   the function name/id.
+                    # - text_delta: the text block start is always empty, so
+                    #   the trigger chunk's text is the block's first token.
+                    # - thinking_delta: same, but only when the block start
+                    #   doesn't already embed the thinking content (it does
+                    #   for providers that send Anthropic-native
+                    #   thinking_blocks).
+                    if processed_chunk.get("type") == "content_block_delta" and isinstance(
+                        processed_chunk.get("delta"), dict
                     ):
-                        self.chunk_queue.append(processed_chunk)
+                        trigger_delta = processed_chunk["delta"]
+                        trigger_delta_type = trigger_delta.get("type")
+                        if (
+                            (
+                                trigger_delta_type == "input_json_delta"
+                                and trigger_delta.get("partial_json")
+                            )
+                            or (
+                                trigger_delta_type == "text_delta"
+                                and trigger_delta.get("text")
+                            )
+                            or (
+                                trigger_delta_type == "thinking_delta"
+                                and trigger_delta.get("thinking")
+                                and not self.current_content_block_start.get("thinking")
+                            )
+                        ):
+                            self.chunk_queue.append(processed_chunk)
 
                     self.sent_content_block_finish = False
                     return self.chunk_queue.popleft()
@@ -323,13 +343,9 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
 
                 if not self.queued_usage_chunk:
                     if should_start_new_block and not self.sent_content_block_finish:
-                        # Queue the sequence: content_block_stop -> content_block_start
-                        # For text blocks the trigger chunk is not emitted as a separate
-                        # delta because content_block_start carries the information.
-                        # For tool_use blocks we must also emit the trigger chunk's delta
-                        # when it carries input_json_delta data, because some providers
-                        # (e.g. xAI, Gemini) include tool arguments in the same streaming
-                        # chunk as the function name/id.
+                        # Queue the sequence: content_block_stop -> content_block_start,
+                        # then re-queue the trigger chunk's delta when it carries payload
+                        # the new content_block_start doesn't already include (see step 3).
 
                         # 1. Stop current content block
                         self.chunk_queue.append(
@@ -346,16 +362,45 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
                             }
                         )
 
-                        # 3. If the trigger chunk carries tool argument data, queue it
-                        # so the input_json_delta is not silently dropped.
-                        if (
-                            processed_chunk.get("type") == "content_block_delta"
-                            and isinstance(processed_chunk.get("delta"), dict)
-                            and processed_chunk["delta"].get("type")
-                            == "input_json_delta"
-                            and processed_chunk["delta"].get("partial_json")
+                        # 3. If the trigger chunk itself carries delta payload
+                        # not already embedded in the new content_block_start,
+                        # queue it so the first delta of the block isn't
+                        # silently dropped:
+                        # - input_json_delta: some providers (e.g. xAI, Gemini)
+                        #   include tool arguments in the same streaming chunk
+                        #   as the function name/id.
+                        # - text_delta: the text block start is always empty,
+                        #   so the trigger chunk's text is the block's first
+                        #   token.
+                        # - thinking_delta: same, but only when the block start
+                        #   doesn't already embed the thinking content (it does
+                        #   for providers that send Anthropic-native
+                        #   thinking_blocks).
+                        if processed_chunk.get(
+                            "type"
+                        ) == "content_block_delta" and isinstance(
+                            processed_chunk.get("delta"), dict
                         ):
-                            self.chunk_queue.append(processed_chunk)
+                            trigger_delta = processed_chunk["delta"]
+                            trigger_delta_type = trigger_delta.get("type")
+                            if (
+                                (
+                                    trigger_delta_type == "input_json_delta"
+                                    and trigger_delta.get("partial_json")
+                                )
+                                or (
+                                    trigger_delta_type == "text_delta"
+                                    and trigger_delta.get("text")
+                                )
+                                or (
+                                    trigger_delta_type == "thinking_delta"
+                                    and trigger_delta.get("thinking")
+                                    and not self.current_content_block_start.get(
+                                        "thinking"
+                                    )
+                                )
+                            ):
+                                self.chunk_queue.append(processed_chunk)
 
                         # Reset state for new block
                         self.sent_content_block_finish = False
