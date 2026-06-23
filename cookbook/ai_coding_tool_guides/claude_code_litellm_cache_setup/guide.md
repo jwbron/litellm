@@ -1,6 +1,6 @@
 # Claude Code → LiteLLM → Qwen/DeepSeek, with prompt caching (one-shot setup)
 
-`clm-setup` is a single, self-contained script that stands up a **host-side
+`cllm-setup` is a single, self-contained script that stands up a **host-side
 LiteLLM proxy** and wires **Claude Code** to drive non-Anthropic models
 (Qwen / DeepSeek via OpenRouter) — while real Claude traffic keeps going
 straight to `api.anthropic.com`. It runs on **Fedora/Linux** (systemd user
@@ -34,7 +34,7 @@ routed model — its caching is automatic/prefix-based and ignores
    translation).
 5. **`~/.config/litellm/config.yaml`** — generated **interactively** (offers
    three recommended models, then lets you add your own with provider pinning
-   and `reasoning_effort`). `CLM_DEFAULTS=1` skips the prompts.
+   and `reasoning_effort`). `CLLM_DEFAULTS=1` skips the prompts.
 6. **A background service** — a shared run-wrapper driven by a systemd `--user`
    unit (Linux) or a launchd LaunchAgent (macOS).
 7. **`cllm`** — a Claude Code launcher that points it at the proxy and sets the
@@ -56,10 +56,10 @@ routed model — its caching is automatic/prefix-based and ignores
 
 ```bash
 # Interactive (prompts for the OpenRouter key and the model list):
-./clm-setup
+./cllm-setup
 
 # Non-interactive (reuse an existing key, seed the 3 default models):
-CLM_DEFAULTS=1 ./clm-setup </dev/null
+CLLM_DEFAULTS=1 ./cllm-setup </dev/null
 ```
 
 Then start a routed session:
