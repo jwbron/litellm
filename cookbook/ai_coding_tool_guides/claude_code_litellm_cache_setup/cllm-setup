@@ -7,7 +7,7 @@
 #
 #   1. uv (user-level, no sudo) if missing
 #   2. litellm[proxy] from the jwbron/litellm fork, pinned to the commit
-#      that carries the cache_control passthrough patches (PR #1). This
+#      that carries the cache_control passthrough patches (PR #2). This
 #      replaces the old patch-and-restart `relitellm` dance — the patches
 #      are baked into the build.
 #   3. ~/.config/litellm/litellm.env  (OPENROUTER_API_KEY; no master key
