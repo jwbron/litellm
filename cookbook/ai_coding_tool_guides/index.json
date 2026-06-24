@@ -131,4 +131,17 @@
         "Claude Code",
         "LiteLLM"
     ]
+},
+{
+    "title": "Claude Code with Qwen + Prompt Caching (cllm-setup)",
+    "description": "One-shot, cross-platform script (Fedora/macOS) that stands up the LiteLLM proxy and routes Claude Code at any OpenRouter model, with the fork's fixes that make prompt caching actually land (cache_control for Qwen, automatic prefix caching for DeepSeek).",
+    "url": "https://github.com/jwbron/litellm/tree/main/cookbook/ai_coding_tool_guides/claude_code_litellm_cache_setup",
+    "date": "2026-05-28",
+    "version": "1.0.0",
+    "tags": [
+        "Claude Code",
+        "LiteLLM",
+        "OpenRouter",
+        "Prompt Caching"
+    ]
 }]
