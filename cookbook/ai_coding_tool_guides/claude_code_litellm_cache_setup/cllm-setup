@@ -147,22 +147,39 @@ write_cost_callback() {
 """LiteLLM custom logger: write authoritative OpenRouter cost per Claude
 Code session to ~/.local/state/cllm/cost-<session_id>.json.
 
-Why: Anthropic's `/v1/messages` response shape has no `cost` field. The
-upstream OpenRouter response carries `usage.cost` (actual provider-billed
-cost), but it gets stripped when LiteLLM translates the response back to
-Anthropic format for Claude Code. We hook the proxy's post-call success
-path, pull the raw upstream JSON out of
-`litellm_logging_obj.model_call_details.original_response`, and persist
-the cost keyed by Claude Code's session_id (sent on every request as
-`x-claude-code-session-id`).
+Why: Anthropic's `/v1/messages` response has no `cost` field, and when the
+call is *streamed* (Claude Code streams every request) LiteLLM strips
+OpenRouter's `usage.cost` during stream reassembly and computes $0 (it has
+no price for `openrouter/*` models). So neither the response nor any local
+token x rate math yields the real number.
+
+Instead we read the cost straight from the source. Every OpenRouter
+response carries a generation id (`gen-...`, surfaced as `response.id` /
+`_hidden_params.received_model_id`), and OpenRouter's
+`GET /api/v1/generation?id=<gen>` returns the exact billed `usage`
+(dollars) plus native prompt/completion/cached/reasoning token counts --
+the same figures shown on the OpenRouter dashboard. No rate table, no
+per-model upkeep; it tracks whatever OpenRouter actually charges.
+
+The generation record propagates ~20-40s after the response, so the lookup
+polls for up to ~2min. That wait is fully async and happens after the
+response has already streamed to the client, so it adds no user-facing
+latency; a semaphore bounds how many lookups sit in flight at once.
+
+We record from two hooks so both streamed and non-streamed calls are
+covered, deduped by generation id:
+  - async_log_success_event       -- fires for streamed /v1/messages
+  - async_post_call_success_hook  -- fires for non-streamed /v1/messages
 
 Loaded via PYTHONPATH=~/.config/litellm + `callbacks: cost_callback.cllm_cost_logger`.
-The standard log_success_event hooks don't fire for /v1/messages — that's
-why async_post_call_success_hook is the right seam.
 """
+import asyncio
 import json
+import os
 import threading
 from pathlib import Path
+
+import httpx
 
 from litellm.integrations.custom_logger import CustomLogger
 
@@ -170,102 +187,156 @@ STATE_DIR = Path.home() / ".local/state/cllm"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 _lock = threading.Lock()
 
+_GEN_URL = "https://openrouter.ai/api/v1/generation"
 
-def _raw_upstream_usage(data):
+# Remember generation ids we've already billed so the two hooks (or a
+# retry) never double-count. Bounded so it can't grow without limit.
+_seen_gen_ids: "set[str]" = set()
+_seen_lock = threading.Lock()
+_SEEN_CAP = 50000
+
+# OpenRouter's generation record propagates ~20-40s after the response, so
+# we poll for up to ~2min. A semaphore bounds in-flight lookups so a busy
+# session can't pile up unbounded sockets.
+_POLL_DELAYS = (3, 5, 5, 7, 8, 10, 12, 15, 18, 20, 25)  # ~128s total
+_sem = asyncio.Semaphore(24)
+
+
+def _session_id_from_headers(headers):
     try:
-        lo = data.get("litellm_logging_obj")
-        if lo is None:
-            return None
-        mcd = getattr(lo, "model_call_details", None) or {}
-        rr = mcd.get("original_response")
-        if isinstance(rr, str):
-            try:
-                rr = json.loads(rr.strip())
-            except Exception:
-                return None
-        if not isinstance(rr, dict):
-            return None
-        usage = rr.get("usage")
-        return usage if isinstance(usage, dict) else None
+        return (headers or {}).get("x-claude-code-session-id") or None
     except Exception:
         return None
-
-
-def _extract_cost(usage):
-    """Prefer OpenRouter's top-level `cost` (what they bill you); under
-    BYOK that field is zero, so fall back to
-    cost_details.upstream_inference_cost (what the upstream provider bills
-    for the same request)."""
-    u = usage or {}
-    cost = u.get("cost")
-    if isinstance(cost, (int, float)) and cost > 0:
-        return float(cost)
-    details = u.get("cost_details") or {}
-    upstream = details.get("upstream_inference_cost")
-    if isinstance(upstream, (int, float)) and upstream > 0:
-        return float(upstream)
-    return None
-
-
-def _extract_cache_stats(usage):
-    """(prompt_tokens, cached_input_tokens, cache_write_tokens,
-    reasoning_tokens), merging the competing provider schemas."""
-    u = usage or {}
-
-    def _num(x):
-        return float(x) if isinstance(x, (int, float)) else 0.0
-
-    prompt = _num(u.get("prompt_tokens"))
-    pdet = u.get("prompt_tokens_details") or {}
-    cached = _num(u.get("cache_read_input_tokens")) or _num(pdet.get("cached_tokens"))
-    cache_write = _num(u.get("cache_creation_input_tokens")) or _num(
-        pdet.get("cache_write_tokens")
-    )
-    cdet = u.get("completion_tokens_details") or {}
-    reasoning = _num(cdet.get("reasoning_tokens"))
-    return prompt, cached, cache_write, reasoning
 
 
 def _extract_session_id(data):
+    # async_post_call_success_hook payload
     try:
         headers = ((data.get("proxy_server_request") or {}).get("headers")) or {}
-        sid = headers.get("x-claude-code-session-id")
-        return sid or None
+        return _session_id_from_headers(headers)
     except Exception:
         return None
 
 
+def _extract_session_id_from_kwargs(kwargs):
+    # async_log_success_event payload
+    try:
+        lp = kwargs.get("litellm_params") or {}
+        psr = lp.get("proxy_server_request") or {}
+        return _session_id_from_headers(psr.get("headers"))
+    except Exception:
+        return None
+
+
+def _gen_id_from_obj(obj):
+    """Pull a `gen-...` id off a response object or its hidden params."""
+    if obj is None:
+        return None
+    gid = getattr(obj, "id", None)
+    if isinstance(gid, str) and gid.startswith("gen-"):
+        return gid
+    hp = getattr(obj, "_hidden_params", None)
+    if isinstance(hp, dict):
+        rid = hp.get("received_model_id")
+        if isinstance(rid, str) and rid.startswith("gen-"):
+            return rid
+    return None
+
+
+def _mark_seen(gen_id) -> bool:
+    """Return True if this gen_id is new (claim it); False if already billed."""
+    with _seen_lock:
+        if gen_id in _seen_gen_ids:
+            return False
+        if len(_seen_gen_ids) >= _SEEN_CAP:
+            _seen_gen_ids.clear()
+        _seen_gen_ids.add(gen_id)
+        return True
+
+
+async def _fetch_generation(gen_id, api_key):
+    """Poll OpenRouter's generation record until it lands. Returns the
+    `data` dict (with `usage` cost) or None."""
+    headers = {"Authorization": f"Bearer {api_key}"}
+    async with _sem:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            for i in range(len(_POLL_DELAYS) + 1):
+                try:
+                    r = await client.get(
+                        _GEN_URL, params={"id": gen_id}, headers=headers
+                    )
+                    if r.status_code == 200:
+                        d = (r.json() or {}).get("data")
+                        if isinstance(d, dict) and d.get("usage") is not None:
+                            return d
+                    # 404 / not-ready-yet -> wait and retry
+                except Exception:
+                    pass
+                if i < len(_POLL_DELAYS):
+                    await asyncio.sleep(_POLL_DELAYS[i])
+    return None
+
+
+def _write(session_id, gen_data):
+    def _num(x):
+        return float(x) if isinstance(x, (int, float)) else 0.0
+
+    cost = _num(gen_data.get("usage"))
+    prompt = _num(gen_data.get("native_tokens_prompt"))
+    cached = _num(gen_data.get("native_tokens_cached"))
+    completion = _num(gen_data.get("native_tokens_completion"))
+    reasoning = _num(gen_data.get("native_tokens_reasoning"))
+    f = STATE_DIR / f"cost-{session_id}.json"
+    with _lock:
+        try:
+            existing = json.loads(f.read_text())
+        except Exception:
+            existing = {}
+        existing["cost"] = existing.get("cost", 0.0) + cost
+        existing["calls"] = existing.get("calls", 0) + 1
+        existing["prompt_tokens"] = existing.get("prompt_tokens", 0.0) + prompt
+        existing["cached_tokens"] = existing.get("cached_tokens", 0.0) + cached
+        existing["completion_tokens"] = (
+            existing.get("completion_tokens", 0.0) + completion
+        )
+        existing["reasoning_tokens"] = (
+            existing.get("reasoning_tokens", 0.0) + reasoning
+        )
+        f.write_text(json.dumps(existing))
+
+
+async def _record(session_id, gen_id):
+    if not session_id or not gen_id:
+        return
+    if not _mark_seen(gen_id):
+        return
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return
+    gen_data = await _fetch_generation(gen_id, api_key)
+    if gen_data is None:
+        # couldn't confirm cost -- release the claim so a later hook can retry
+        with _seen_lock:
+            _seen_gen_ids.discard(gen_id)
+        return
+    _write(session_id, gen_data)
+
+
 class CllmCostLogger(CustomLogger):
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        try:
+            sid = _extract_session_id_from_kwargs(kwargs)
+            gen_id = _gen_id_from_obj(response_obj) or _gen_id_from_obj(
+                kwargs.get("complete_streaming_response")
+            )
+            await _record(sid, gen_id)
+        except Exception:
+            pass
+
     async def async_post_call_success_hook(self, data, user_api_key_dict, response):
         try:
-            if not isinstance(data, dict):
-                return response
-            usage = _raw_upstream_usage(data)
-            sid = _extract_session_id(data)
-            if not sid:
-                return response
-            cost = _extract_cost(usage)
-            prompt, cached, cache_write, reasoning = _extract_cache_stats(usage)
-            if cost is None and prompt == 0 and cached == 0:
-                return response
-            cost = cost or 0.0
-            f = STATE_DIR / f"cost-{sid}.json"
-            with _lock:
-                try:
-                    existing = json.loads(f.read_text())
-                except Exception:
-                    existing = {}
-                existing["cost"] = existing.get("cost", 0.0) + cost
-                existing["calls"] = existing.get("calls", 0) + 1
-                existing["prompt_tokens"] = existing.get("prompt_tokens", 0.0) + prompt
-                existing["cached_tokens"] = existing.get("cached_tokens", 0.0) + cached
-                existing["cache_write_tokens"] = (
-                    existing.get("cache_write_tokens", 0.0) + cache_write
-                )
-                existing["reasoning_tokens"] = (
-                    existing.get("reasoning_tokens", 0.0) + reasoning
-                )
-                f.write_text(json.dumps(existing))
+            if isinstance(data, dict):
+                await _record(_extract_session_id(data), _gen_id_from_obj(response))
         except Exception:
             pass
         return response

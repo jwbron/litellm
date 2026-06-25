@@ -65,9 +65,11 @@ worked upstream and benefit from the billing-header drop too.
    key: the proxy binds to `127.0.0.1` and runs in LiteLLM's no-auth dev mode,
    so Claude Code's bearer is discarded and the real key is injected upstream.
 4. **`~/.config/litellm/cost_callback.py`** — a custom logger that records
-   authoritative per-session cost + cache stats (pulled from the upstream
-   OpenRouter `usage`, which is otherwise stripped by the Anthropic
-   translation).
+   authoritative per-session cost + cache stats. It reads each response's
+   OpenRouter generation id and looks the exact billed cost up via
+   `GET /api/v1/generation` — which works even for streamed `/v1/messages`
+   calls, where OpenRouter's inline `usage.cost` is stripped by the
+   Anthropic translation. No per-model rate table to maintain.
 5. **`~/.config/litellm/config.yaml`** — generated **interactively**. It seeds
    three recommended models (`qwen3.7-max`, `deepseek-v4-flash`,
    `deepseek-v4-pro`) as a starting point, then lets you add **any OpenRouter
