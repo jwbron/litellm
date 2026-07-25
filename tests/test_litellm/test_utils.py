@@ -4863,3 +4863,78 @@ def test_is_prompt_caching_valid_prompt_explicit_min_token_count_overrides_model
         is_prompt_caching_valid_prompt(model="claude-opus-4-8", messages=PROMPT_CACHE_MESSAGES, min_token_count=8192)
         is False
     )
+
+
+class TestDropParamsVisibility:
+    """`drop_params` must not discard caller-specified params in silence.
+
+    Dropping a param changes generation behaviour, so a `reasoning_effort` or
+    `temperature` set in a proxy config that never reaches the provider is a
+    real behavioural difference with no signal attached. The warning is
+    deduped because the same params are dropped on every request for a given
+    route.
+    """
+
+    def setup_method(self):
+        litellm.utils._DROPPED_PARAM_WARNINGS.clear()
+
+    def test_warns_when_an_unsupported_param_is_dropped(self):
+        # openrouter advertises reasoning_effort only for models flagged
+        # supports_reasoning in the model-cost map; an absent slug is not.
+        with patch.object(litellm.utils.verbose_logger, "warning") as mock_warn:
+            result = litellm.utils.get_optional_params(
+                model="qwen/qwen3-max",
+                custom_llm_provider="openrouter",
+                reasoning_effort="high",
+                drop_params=True,
+            )
+        assert "reasoning_effort" not in result
+        mock_warn.assert_called_once()
+        assert "reasoning_effort" in str(mock_warn.call_args)
+
+    def test_repeat_calls_warn_once(self):
+        with patch.object(litellm.utils.verbose_logger, "warning") as mock_warn:
+            for _ in range(5):
+                litellm.utils.get_optional_params(
+                    model="qwen/qwen3-max",
+                    custom_llm_provider="openrouter",
+                    reasoning_effort="high",
+                    drop_params=True,
+                )
+        assert mock_warn.call_count == 1
+
+    def test_a_different_model_warns_separately(self):
+        with patch.object(litellm.utils.verbose_logger, "warning") as mock_warn:
+            for model in ("qwen/qwen3-max", "vendor/some-other-slug"):
+                litellm.utils.get_optional_params(
+                    model=model,
+                    custom_llm_provider="openrouter",
+                    reasoning_effort="high",
+                    drop_params=True,
+                )
+        assert mock_warn.call_count == 2
+
+    def test_supported_params_do_not_warn(self):
+        with patch.object(litellm.utils.verbose_logger, "warning") as mock_warn:
+            result = litellm.utils.get_optional_params(
+                model="qwen/qwen3-max",
+                custom_llm_provider="openrouter",
+                temperature=0.3,
+                top_p=0.9,
+                drop_params=True,
+            )
+        assert result["temperature"] == 0.3
+        mock_warn.assert_not_called()
+
+    def test_no_warning_when_drop_params_is_off(self):
+        # Without drop_params the caller gets a loud exception instead; the
+        # failure is already visible, so no warning is needed.
+        with patch.object(litellm.utils.verbose_logger, "warning") as mock_warn:
+            with pytest.raises(litellm.utils.UnsupportedParamsError):
+                litellm.utils.get_optional_params(
+                    model="qwen/qwen3-max",
+                    custom_llm_provider="openrouter",
+                    reasoning_effort="high",
+                    drop_params=False,
+                )
+        mock_warn.assert_not_called()

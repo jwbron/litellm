@@ -3759,6 +3759,58 @@ def pre_process_optional_params(passed_params: dict, non_default_params: dict, c
     return optional_params
 
 
+# Warn-once bookkeeping for `drop_params`. Keyed by
+# (provider, model, sorted dropped param names) so a route that drops the same
+# params on every request warns once, not once per call. Bounded so a
+# long-lived proxy serving many models cannot grow it without limit; past the
+# cap we stop recording (and therefore may repeat a warning), which is the safe
+# direction to fail.
+_MAX_DROPPED_PARAM_WARNINGS = 1000
+_DROPPED_PARAM_WARNINGS: set[tuple[str, str, tuple[str, ...]]] = set()
+
+
+def _warn_dropped_params(
+    unsupported_params: dict,
+    model: str | None,
+    custom_llm_provider: str | None,
+) -> None:
+    """Log once when `drop_params` discards caller-specified parameters.
+
+    `drop_params` exists so an unsupported parameter does not fail the whole
+    request, and that tradeoff is right. But dropping a parameter changes
+    generation behaviour, and today it happens with no signal at all: a
+    `reasoning_effort`, `temperature` or penalty set in a proxy config simply
+    never reaches the provider, and nothing in the logs or the response says
+    so. The config and the wire disagree, silently and indefinitely.
+
+    This is easiest to hit on a provider whose supported-param set is derived
+    from the model-cost map: a model absent from the map is treated as
+    supporting nothing beyond the base set, so the gate fails closed for any
+    slug newer than the map — which is a routine state, not an exotic one.
+
+    Warns rather than debugs because the user asked for something and did not
+    get it; deduped so a per-request drop does not flood the log.
+    """
+    if not unsupported_params:
+        return
+    dropped = tuple(sorted(unsupported_params.keys()))
+    key = (custom_llm_provider or "", model or "", dropped)
+    if key in _DROPPED_PARAM_WARNINGS:
+        return
+    if len(_DROPPED_PARAM_WARNINGS) < _MAX_DROPPED_PARAM_WARNINGS:
+        _DROPPED_PARAM_WARNINGS.add(key)
+    verbose_logger.warning(
+        "litellm.drop_params: dropping unsupported params %s for model=%s, "
+        "provider=%s. They will NOT reach the provider, so whatever behaviour "
+        "they were meant to control is unchanged. To send them anyway, pass "
+        "allowed_openai_params=%s.",
+        list(dropped),
+        model,
+        custom_llm_provider,
+        list(dropped),
+    )
+
+
 def get_optional_params(
     # use the openai defaults
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -3857,6 +3909,11 @@ def get_optional_params(
 
         if unsupported_params:
             if litellm.drop_params is True or (drop_params is not None and drop_params is True):
+                _warn_dropped_params(
+                    unsupported_params=unsupported_params,
+                    model=model,
+                    custom_llm_provider=custom_llm_provider,
+                )
                 for k in unsupported_params.keys():
                     non_default_params.pop(k, None)
             else:
