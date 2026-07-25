@@ -3803,10 +3803,13 @@ def _warn_dropped_params(
         "litellm.drop_params: dropping unsupported params %s for model=%s, "
         "provider=%s. They will NOT reach the provider, so whatever behaviour "
         "they were meant to control is unchanged. To send them anyway, pass "
-        "allowed_openai_params=%s.",
+        "allowed_openai_params=%s in the request, or on the proxy add "
+        "`allowed_openai_params: %s` to that model's litellm_params in "
+        "config.yaml.",
         list(dropped),
         model,
         custom_llm_provider,
+        list(dropped),
         list(dropped),
     )
 

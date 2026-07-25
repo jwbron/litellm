@@ -4926,6 +4926,25 @@ class TestDropParamsVisibility:
         assert result["temperature"] == 0.3
         mock_warn.assert_not_called()
 
+    def test_warning_names_both_remedies(self):
+        # Most people hit this on the proxy, reading a config.yaml rather than
+        # writing request kwargs, so a message naming only the per-request form
+        # reads as "not applicable to me". `allowed_openai_params` is settable
+        # in a model_list entry's litellm_params (LiteLLM_Params is
+        # ConfigDict(extra="allow")) and does reach get_optional_params from
+        # there, so both routes are worth naming.
+        with patch.object(litellm.utils.verbose_logger, "warning") as mock_warn:
+            litellm.utils.get_optional_params(
+                model="qwen/qwen3-max",
+                custom_llm_provider="openrouter",
+                reasoning_effort="high",
+                drop_params=True,
+            )
+        message = mock_warn.call_args[0][0]
+        assert "allowed_openai_params" in message
+        assert "litellm_params" in message
+        assert "config.yaml" in message
+
     def test_no_warning_when_drop_params_is_off(self):
         # Without drop_params the caller gets a loud exception instead; the
         # failure is already visible, so no warning is needed.
