@@ -33,7 +33,6 @@ import json
 import os
 import threading
 import time
-from typing import Dict, Optional, Set
 
 from litellm._logging import verbose_logger
 
@@ -50,7 +49,7 @@ DEFAULT_TIMEOUT_SECONDS = 5.0
 # An empty dict is a real, meaningful state: it records a failed fetch, so the
 # negative cache below can suppress retries without conflating "we asked and
 # got nothing" with "we never asked".
-_CACHE: Optional[Dict[str, Set[str]]] = None
+_CACHE: dict[str, set[str]] | None = None
 _CACHE_STAMP: float = 0.0
 _LOCK = threading.Lock()
 
@@ -77,7 +76,7 @@ def _ttl_seconds() -> float:
     return _env_float("LITELLM_OPENROUTER_CAPABILITY_TTL", DEFAULT_TTL_SECONDS)
 
 
-def _fetch() -> Dict[str, Set[str]]:
+def _fetch() -> dict[str, set[str]]:
     """Fetch the model list. Returns ``{}` on any failure."""
     # Imported here rather than at module scope: http_handler pulls in a large
     # slice of litellm, and this module is imported from a transformation that
@@ -113,7 +112,7 @@ def _fetch() -> Dict[str, Set[str]]:
     if not isinstance(entries, list):
         return {}
 
-    capabilities: Dict[str, Set[str]] = {}
+    capabilities: dict[str, set[str]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -125,7 +124,7 @@ def _fetch() -> Dict[str, Set[str]]:
     return capabilities
 
 
-def _get_cache() -> Dict[str, Set[str]]:
+def _get_cache() -> dict[str, set[str]]:
     global _CACHE, _CACHE_STAMP
 
     now = time.monotonic()
@@ -172,7 +171,7 @@ def _candidate_slugs(model: str) -> list:
     return candidates
 
 
-def get_supported_parameters(model: str) -> Optional[Set[str]]:
+def get_supported_parameters(model: str) -> set[str] | None:
     """Parameter names OpenRouter advertises for ``model``.
 
     Returns ``None`` when the answer is unknown for any reason: the lookup is
