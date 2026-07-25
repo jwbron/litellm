@@ -19,6 +19,7 @@ from litellm.types.llms.openrouter import OpenRouterErrorMessage
 from litellm.types.utils import ModelResponse, ModelResponseStream
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
+from ..capabilities import get_supported_parameters as get_openrouter_supported_parameters
 from ..common_utils import OpenRouterException
 
 
@@ -42,9 +43,41 @@ class CacheControlSupportedModels(str, Enum):
 class OpenrouterConfig(OpenAIGPTConfig):
     def get_supported_openai_params(self, model: str) -> list:
         """
-        Allow reasoning parameters for models flagged as reasoning-capable.
+        Allow reasoning parameters for models that accept them.
+
+        OpenRouter publishes per-model ``supported_parameters`` over an
+        unauthenticated endpoint, so prefer that over the bundled model-cost
+        map. The map is wrong here by construction: OpenRouter ships new slugs
+        continuously and the map lags, so a current model answers
+        ``supports_reasoning() -> False`` and its reasoning knobs are dropped
+        before the request body is built, silently.
+
+        The live answer is used **additively**: it can admit a knob the map
+        does not know about, but it never withholds one the map would have
+        allowed. That asymmetry is deliberate, because
+        ``supported_parameters`` under-reports ``reasoning_effort``.
+        ``deepseek/deepseek-r1`` is flagged ``supports_reasoning: true`` in the
+        bundled map and is unambiguously a reasoning model, yet OpenRouter
+        advertises only ``reasoning`` and ``include_reasoning`` for it: the
+        OpenAI-compatible ``reasoning_effort`` spelling is treated as an alias
+        of the native ``reasoning`` object rather than listed in its own right.
+        Reading its absence as a denial would drop a working parameter, which
+        is the exact failure this change exists to remove.
+
+        So the two sources are unioned, and the worst case is precisely what
+        shipped before.
         """
         supported_params = super().get_supported_openai_params(model=model)
+
+        advertised = get_openrouter_supported_parameters(model)
+        if advertised is not None:
+            if "reasoning_effort" in advertised:
+                supported_params.append("reasoning_effort")
+            # LiteLLM's `thinking` is the Anthropic-shaped reasoning control;
+            # OpenRouter's equivalent surface is its native `reasoning` object.
+            if "reasoning" in advertised:
+                supported_params.append("thinking")
+
         try:
             if litellm.supports_reasoning(model=model, custom_llm_provider="openrouter") or litellm.supports_reasoning(
                 model=model
