@@ -82,14 +82,27 @@ worked upstream and benefit from the billing-header drop too.
    for true-1M models, subagent model pinning, capability gating,
    English-language anchor).
 8. **Optional harness extras** — a plain statusline that splices in the real
-   cost + cache-hit rate, a conditional DuckDuckGo MCP server, a hook that
-   blocks the (non-functional on this route) built-in WebSearch/WebFetch, and
-   the `settings.json` / `~/.claude.json` wiring for them.
+   cost + cache-hit rate, a local SearXNG instance behind a conditional
+   `mcp-searxng` server, a hook that blocks the (non-functional on this route)
+   built-in WebSearch/WebFetch and points the model at the SearXNG tools
+   instead, and the `settings.json` / `~/.claude.json` wiring for them.
+
+   Search is rebuilt out of local parts because the built-in WebSearch and
+   WebFetch genuinely do not work here: they are Anthropic server tools that
+   run inline in the model turn, so on this route their schemas get stripped
+   and the calls silently no-op. This step used to install the DuckDuckGo MCP
+   server, which called DDG directly and inherited its CAPTCHAs; three
+   consecutive searches were enough to trip one. SearXNG fans each query across
+   several engines, so one engine getting throttled degrades a query instead of
+   ending it.
 
 ## Prerequisites
 
 - `jq`, `python3`, `curl` (the script prints the `dnf`/`brew` command if any
   are missing).
+- For the SearXNG search backend: `docker` or `podman`, plus `npx` (Node) for
+  the MCP server. Both are optional; without them the script warns and skips
+  step 8's search wiring, and the rest of the stack still installs.
 - An [OpenRouter](https://openrouter.ai) API key.
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview).
 
