@@ -18,9 +18,17 @@
 #        Linux -> systemd --user unit
 #        macOS -> launchd LaunchAgent
 #   7. ~/.local/bin/cllm  (+ claude-litellm symlink) -- the Claude Code launcher
-#   8. harness extras: a plain statusline (cost + cache %), the DuckDuckGo
-#      MCP wrapper, the WebSearch/WebFetch block hook, and the settings.json
-#      / .claude.json wiring for them.
+#   8. harness extras: a plain statusline (cost + cache %), a containerised
+#      SearXNG instance + its MCP wrapper, the WebSearch/WebFetch block hook,
+#      and the settings.json / .claude.json wiring for them.
+#
+# On the LiteLLM route the built-in WebSearch/WebFetch are dead (their
+# Anthropic server-tool schemas run inline in the model turn and get stripped),
+# so step 8 rebuilds both out of local parts. This used to be the DuckDuckGo
+# MCP server calling DDG directly; it inherited DDG's CAPTCHAs, which measured
+# three consecutive searches to trip on 2026-07-28. SearXNG fans each query
+# across several engines instead, so one engine throttling degrades a query
+# rather than ending it.
 #
 # Re-runnable. Existing config.yaml / env / settings are detected and you
 # are asked before anything is overwritten. Set CLLM_DEFAULTS=1 to skip the
@@ -33,6 +41,11 @@ LITELLM_SPEC="litellm[proxy] @ git+https://github.com/jwbron/litellm@${LITELLM_F
 PORT="${LITELLM_PORT:-4000}"
 
 CONFIG_DIR="$HOME/.config/litellm"
+SEARXNG_DIR="$HOME/.config/searxng"
+SEARXNG_PORT="${SEARXNG_PORT:-8888}"
+SEARXNG_IMAGE="${SEARXNG_IMAGE:-docker.io/searxng/searxng:latest}"
+# Pinned so an upstream publish cannot change tool behaviour mid-session.
+MCP_SEARXNG_VERSION="${MCP_SEARXNG_VERSION:-1.12.0}"
 STATE_DIR="$HOME/.local/state/cllm"
 BIN_DIR="$HOME/.local/bin"
 CLAUDE_DIR="$HOME/.claude"
@@ -616,20 +629,202 @@ EOF
   ok "wrote $CLAUDE_DIR/statusline.sh"
 }
 
-write_ddg_wrapper() {
-  cat > "$BIN_DIR/ddg-mcp-wrapper" <<'EOF'
+write_searxng_wrapper() {
+  cat > "$BIN_DIR/searxng-mcp-wrapper" <<EOF
 #!/bin/bash
-# Conditional DuckDuckGo MCP server: active only on the LiteLLM route
+# Conditional SearXNG MCP server: active only on the LiteLLM route
 # (ANTHROPIC_CUSTOM_MODEL_OPTION set). On first-party Claude it exits
 # cleanly so built-in WebSearch/WebFetch stay available.
-if [[ -n "$ANTHROPIC_CUSTOM_MODEL_OPTION" ]]; then
-  exec uvx duckduckgo-mcp-server "$@"
+#
+# Replaced the DuckDuckGo MCP server on 2026-07-28. That one called DDG
+# directly and inherited its CAPTCHAs; three consecutive searches were enough
+# to trip one. SearXNG fans the same query across several engines, so one
+# engine throttling no longer takes web search out.
+#
+# Version is pinned rather than floating on @latest so an upstream publish
+# cannot change tool behaviour underneath a session. Bump deliberately.
+if [[ -n "\$ANTHROPIC_CUSTOM_MODEL_OPTION" ]]; then
+  export SEARXNG_URL="\${SEARXNG_URL:-http://localhost:$SEARXNG_PORT}"
+  exec npx -y mcp-searxng@$MCP_SEARXNG_VERSION "\$@"
 else
   exit 0
 fi
 EOF
-  chmod +x "$BIN_DIR/ddg-mcp-wrapper"
-  ok "wrote $BIN_DIR/ddg-mcp-wrapper"
+  chmod +x "$BIN_DIR/searxng-mcp-wrapper"
+  ok "wrote $BIN_DIR/searxng-mcp-wrapper"
+  # The DDG server this replaced would otherwise keep answering from a stale
+  # .claude.json entry on a box set up before 2026-07-28.
+  rm -f "$BIN_DIR/ddg-mcp-wrapper"
+}
+
+write_searxng_config() {
+  mkdir -p "$SEARXNG_DIR"
+
+  # secret_key is deliberately absent: SearXNG reads $SEARXNG_SECRET from the
+  # environment, so the signing key stays out of any tracked file.
+  if [[ -f "$SEARXNG_DIR/settings.yml" ]] && ! confirm "overwrite $SEARXNG_DIR/settings.yml?"; then
+    log "keeping existing settings.yml"
+  else
+    cat > "$SEARXNG_DIR/settings.yml" <<'EOF'
+# Host-side SearXNG: the search backend for Claude Code's web tools on the
+# LiteLLM route. Single user, bound to loopback by run-searxng.sh, queried
+# only by the mcp-searxng server.
+#
+# Everything not named here comes from the image's own settings.yml.
+use_default_settings: true
+
+server:
+  # No secret_key here on purpose: SearXNG picks it up from $SEARXNG_SECRET,
+  # which run-searxng.sh passes in from searxng.env (untracked, mode 600).
+  # Verified 2026-07-28 that the instance boots and serves with the env var
+  # alone, so no signing key lands in the dotfiles repo.
+  #
+  # The limiter exists to keep public instances from being scraped. This one
+  # answers only to 127.0.0.1, and leaving it on makes the MCP server look
+  # like a bot to our own instance.
+  limiter: false
+  public_instance: false
+
+search:
+  # json is what mcp-searxng consumes; it is NOT enabled by default upstream.
+  # html stays on so the instance is browsable at http://localhost:8888 when
+  # you want to sanity-check a query by hand.
+  formats:
+    - html
+    - json
+
+engines:
+  # Measured 2026-07-28 over three consecutive queries: brave answered none of
+  # them ("too many requests", then "Suspended"), so it only adds latency.
+  # Google CSE (20 results/query) and Startpage (10) carried every query;
+  # DuckDuckGo contributed until it hit a CAPTCHA on the third. That spread is
+  # the entire point of running a metasearch layer rather than calling DDG
+  # directly the way the old ddg MCP server did: one engine getting throttled
+  # stops being an outage.
+  - name: brave
+    disabled: true
+EOF
+    ok "wrote $SEARXNG_DIR/settings.yml"
+  fi
+
+  if [[ -f "$SEARXNG_DIR/searxng.env" ]]; then
+    ok "kept existing $SEARXNG_DIR/searxng.env"
+  else
+    ( umask 077
+      printf 'SEARXNG_SECRET=%s\n' "$(python3 -c 'import secrets; print(secrets.token_hex(32))')" \
+        > "$SEARXNG_DIR/searxng.env" )
+    chmod 600 "$SEARXNG_DIR/searxng.env"
+    ok "generated $SEARXNG_DIR/searxng.env"
+  fi
+
+  cat > "$SEARXNG_DIR/run-searxng.sh" <<EOF
+#!/usr/bin/env bash
+# Run the host-side SearXNG instance in the foreground, for searxng.service.
+#
+# Loopback-only: mcp-searxng is the sole client, so the port is published to
+# 127.0.0.1 rather than 0.0.0.0. Nothing off-box should reach this, and a
+# public SearXNG is a spam magnet.
+set -euo pipefail
+
+CONFIG_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+PORT="\${SEARXNG_PORT:-$SEARXNG_PORT}"
+IMAGE="\${SEARXNG_IMAGE:-$SEARXNG_IMAGE}"
+NAME="\${SEARXNG_CONTAINER:-searxng}"
+
+RUNTIME=""
+for candidate in docker podman; do
+  if command -v "\$candidate" >/dev/null 2>&1; then RUNTIME="\$candidate"; break; fi
+done
+if [[ -z \$RUNTIME ]]; then
+  echo "searxng: neither docker nor podman is installed" >&2
+  exit 1
+fi
+
+# SEARXNG_SECRET lives here, never in the tracked settings.yml.
+if [[ -f "\$CONFIG_DIR/searxng.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "\$CONFIG_DIR/searxng.env"
+  set +a
+fi
+if [[ -z \${SEARXNG_SECRET:-} ]]; then
+  echo "searxng: SEARXNG_SECRET is unset; add it to \$CONFIG_DIR/searxng.env" >&2
+  exit 1
+fi
+
+# A crash or a \`docker kill\` can leave the old container behind and --rm only
+# fires on a clean exit, so the name would collide on restart.
+"\$RUNTIME" rm -f "\$NAME" >/dev/null 2>&1 || true
+
+# Mount settings.yml alone, not the whole directory: searxng.env sits next to
+# it and has no business inside the container. :Z is required on Fedora, where
+# SELinux otherwise denies the read (fails with EACCES at startup).
+exec "\$RUNTIME" run --rm --name "\$NAME" \\
+  -p "127.0.0.1:\$PORT:8080" \\
+  -v "\$CONFIG_DIR/settings.yml:/etc/searxng/settings.yml:ro,Z" \\
+  -e "SEARXNG_SECRET=\$SEARXNG_SECRET" \\
+  -e "SEARXNG_BASE_URL=http://localhost:\$PORT/" \\
+  "\$IMAGE"
+EOF
+  chmod +x "$SEARXNG_DIR/run-searxng.sh"
+  ok "wrote $SEARXNG_DIR/run-searxng.sh"
+}
+
+setup_searxng() {
+  if ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; then
+    warn "no docker or podman — skipping SearXNG."
+    warn "  Web search on the LiteLLM route will not work until you install one and re-run."
+    return 0
+  fi
+  if ! command -v npx >/dev/null 2>&1; then
+    warn "no npx (install nodejs) — the SearXNG MCP server cannot start without it"
+  fi
+
+  write_searxng_config
+
+  if [[ $OS != linux ]]; then
+    warn "SearXNG service unit is Linux-only; start it by hand:"
+    warn "  $SEARXNG_DIR/run-searxng.sh"
+    return 0
+  fi
+
+  local unit_dir="$HOME/.config/systemd/user"
+  mkdir -p "$unit_dir"
+  cat > "$unit_dir/searxng.service" <<'EOF'
+[Unit]
+Description=SearXNG metasearch (host-side, backs Claude Code web tools on the LiteLLM route)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.config/searxng/run-searxng.sh
+# --rm only cleans up on a clean exit; make sure a killed unit does not leave
+# a stopped container squatting on the name.
+ExecStopPost=-/bin/sh -c 'docker rm -f searxng >/dev/null 2>&1 || podman rm -f searxng >/dev/null 2>&1 || true'
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable searxng.service >/dev/null
+  systemctl --user restart searxng.service
+  ok "searxng.service installed + (re)started"
+
+  # First start pulls the image, so allow well past the proxy's 20s budget.
+  local i
+  for i in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:$SEARXNG_PORT/healthz" >/dev/null 2>&1; then
+      ok "searxng is live on 127.0.0.1:$SEARXNG_PORT"
+      return 0
+    fi
+    sleep 2
+  done
+  warn "searxng did not come up in 120s"
+  echo "  logs: journalctl --user -u searxng.service -n 40 --no-pager"
 }
 
 write_block_hook() {
@@ -638,15 +833,19 @@ write_block_hook() {
 #!/bin/bash
 # Block built-in WebSearch/WebFetch on the LiteLLM route (their Anthropic
 # server-tool schemas are stripped by drop_params and silently no-op).
-# Redirect the model to the DDG MCP tools instead.
+# Redirect the model to the SearXNG MCP tools instead.
 if [[ -z "$ANTHROPIC_CUSTOM_MODEL_OPTION" ]]; then
   # First-party Claude route: built-in tools are live. No decision to report;
   # let the call continue through the normal permission flow.
   exit 0
 fi
 
-# LiteLLM route: deny with a hint so the model picks the DDG MCP tools.
-printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"WebSearch and WebFetch do not work in this session. Use mcp__ddg__search instead of WebSearch, and mcp__ddg__fetch_content instead of WebFetch. Retry your operation with those tools."}}'
+# LiteLLM route: deny with a hint so the model picks the SearXNG MCP tools.
+# The trafilatura note is not redundant with web_url_read: web_url_read
+# converts the whole document via node-html-markdown with no boilerplate
+# stripping, which measured 1.8x the bytes of trafilatura on a docs page and
+# puts nav chrome ahead of the content. Worth reaching for on noisy pages.
+printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"WebSearch and WebFetch do not work in this session. Use mcp__searxng__searxng_web_search instead of WebSearch, and mcp__searxng__web_url_read instead of WebFetch. If a fetched page comes back buried in navigation and sidebar links, re-fetch it with Bash: uvx --from trafilatura trafilatura -u <url> --markdown. Retry your operation with those tools."}}'
 exit 0
 EOF
   chmod +x "$HOOKS_DIR/block-builtin-web-tools.sh"
@@ -687,10 +886,10 @@ PYEOF
 }
 
 patch_claude_mcp() {
-  # Register the ddg stdio MCP server in ~/.claude.json, preserving state.
-  python3 - "$HOME/.claude.json" "$BIN_DIR/ddg-mcp-wrapper" <<'PYEOF'
+  # Register the searxng stdio MCP server in ~/.claude.json, preserving state.
+  python3 - "$HOME/.claude.json" "$BIN_DIR/searxng-mcp-wrapper" "$SEARXNG_PORT" <<'PYEOF'
 import json, os, sys
-p, wrapper = sys.argv[1], sys.argv[2]
+p, wrapper, port = sys.argv[1], sys.argv[2], sys.argv[3]
 if os.path.exists(p):
     try:
         d = json.load(open(p))
@@ -698,21 +897,26 @@ if os.path.exists(p):
         sys.exit("refusing to overwrite unparseable %s: %s" % (p, e))
 else:
     d = {}
-d.setdefault("mcpServers", {})["ddg"] = {
+servers = d.setdefault("mcpServers", {})
+# Drop the DuckDuckGo server this replaced; leaving it registered on an
+# already-provisioned box gives the model a second, worse search tool.
+servers.pop("ddg", None)
+servers["searxng"] = {
     "type": "stdio",
     "command": wrapper,
     "args": [],
-    "env": {"DDG_SAFE_SEARCH": "MODERATE"},
+    "env": {"SEARXNG_URL": "http://localhost:%s" % port},
 }
 json.dump(d, open(p, "w"), indent=2)
-print("registered ddg in", p)
+print("registered searxng in", p)
 PYEOF
-  ok "registered ddg MCP server in ~/.claude.json"
+  ok "registered searxng MCP server in ~/.claude.json"
 }
 
 setup_harness_extras() {
   write_statusline
-  write_ddg_wrapper
+  setup_searxng
+  write_searxng_wrapper
   write_block_hook
   patch_claude_settings
   patch_claude_mcp
@@ -760,6 +964,8 @@ ${c_grn}Done.${c_rst} LiteLLM proxy + Claude Code routing are set up.
 EOF
   if [[ $OS == linux ]]; then
     echo "  Restart proxy:             systemctl --user restart litellm.service"
+    echo "  Restart search:            systemctl --user restart searxng.service"
+    echo "  Search health:             curl http://127.0.0.1:$SEARXNG_PORT/healthz"
   else
     echo "  Restart proxy:             launchctl kickstart -k gui/\$(id -u)/com.jwbron.litellm"
   fi
