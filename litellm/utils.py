@@ -5435,6 +5435,30 @@ def _get_model_info_helper(
                     key, _model_info = generalization
 
             if _model_info is None or key is None:
+                # OpenRouter publishes its own rate card at GET /api/v1/models,
+                # and the bundled map lags its slugs by construction — the same
+                # root cause that makes `supports_reasoning` answer False for a
+                # current model. Consult the live card before giving up.
+                #
+                # Placed here, after every map lookup has already failed, so a
+                # slug the bundled map DOES carry keeps the bundled answer: the
+                # live card can add a model but never reprice one. Cost fields
+                # only; see llms/openrouter/capabilities.py for why capability
+                # flags deliberately do not arrive through this door, and why a
+                # rate card tiered by prompt length is declined rather than
+                # approximated.
+                try:
+                    from litellm.llms.openrouter.capabilities import (
+                        get_model_cost_entry as _openrouter_cost_entry,
+                    )
+
+                    _live_entry = _openrouter_cost_entry(model, custom_llm_provider)
+                except Exception:
+                    _live_entry = None
+                if _live_entry is not None:
+                    _model_info = _live_entry
+                    key = _live_entry.get("key") or model
+            if _model_info is None or key is None:
                 raise ValueError(
                     "This model isn't mapped yet. Add it here - https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json"
                 )
