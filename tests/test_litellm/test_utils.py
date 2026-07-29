@@ -4878,6 +4878,25 @@ class TestDropParamsVisibility:
     def setup_method(self):
         litellm.utils._DROPPED_PARAM_WARNINGS.clear()
 
+    @pytest.fixture(autouse=True)
+    def _deterministic_openrouter_lookups(self, monkeypatch):
+        """Keep these tests on the bundled model-cost map.
+
+        `get_optional_params` reaches `get_model_info`, which consults
+        OpenRouter's live model list for both supported params and pricing.
+        Left on, these tests do real HTTP and their outcome depends on what
+        OpenRouter published that morning — and a model with a prompt-length
+        rate card emits a pricing warning here, which is correct behaviour but
+        not what this class is counting. Same discipline as the autouse
+        fixture in tests/test_litellm/llms/openrouter/conftest.py.
+        """
+        monkeypatch.setenv("LITELLM_OPENROUTER_CAPABILITY_FETCH", "0")
+        from litellm.llms.openrouter import capabilities
+
+        capabilities.reset_cache()
+        yield
+        capabilities.reset_cache()
+
     def test_warns_when_an_unsupported_param_is_dropped(self):
         # openrouter advertises reasoning_effort only for models flagged
         # supports_reasoning in the model-cost map; an absent slug is not.
