@@ -21,6 +21,7 @@ from litellm.types.utils import ModelResponse, ModelResponseStream
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
 from ..capabilities import get_supported_parameters as get_openrouter_supported_parameters
 from ..common_utils import OpenRouterException
+from ..reasoning import map_thinking_blocks_to_reasoning_content
 
 
 class CacheControlSupportedModels(str, Enum):
@@ -194,6 +195,13 @@ class OpenrouterConfig(OpenAIGPTConfig):
         """
         if self._supports_cache_control_in_content(model):
             messages = self._move_cache_control_to_content(messages)
+
+        # The Anthropic adapter parks prior-turn assistant reasoning on
+        # `thinking_blocks`, which nothing on this request path reads; map it
+        # onto the field OpenRouter documents for multi-turn tool calling so
+        # models whose template re-renders prior thinking stop receiving an
+        # empty <think></think> for every previous turn. See ../reasoning.py.
+        messages = map_thinking_blocks_to_reasoning_content(messages)
 
         extra_body = optional_params.pop("extra_body", {})
         response = super().transform_request(model, messages, optional_params, litellm_params, headers)
